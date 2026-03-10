@@ -2,7 +2,7 @@ apiVersion: v2
 name: opencode
 description: A Helm chart for OpenCode AI coding assistant
 type: application
-version: 0.13.0
+version: 0.13.1
 appVersion: "latest"
 icon: https://opencode.ai/favicon.ico
 keywords:
@@ -16,3 +16,5 @@ sources:
 maintainers:
   - name: fluxbase-eu
     url: https://github.com/fluxbase-eu
+  - name: AaronYang
+    url: https://github.com/AaronYang0628
