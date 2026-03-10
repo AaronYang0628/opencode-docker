@@ -19,7 +19,9 @@ metadata:
 spec:
   accessModes:
     - {{ .Values.persistence.accessMode }}
+  {{- if .Values.persistence.storageClass }}
   storageClassName: {{ .Values.persistence.storageClass }}
+  {{- end }}
   resources:
     requests:
       storage: {{ .Values.persistence.config.size | default .Values.persistence.size }}
@@ -45,7 +47,9 @@ metadata:
 spec:
   accessModes:
     - {{ .Values.persistence.accessMode }}
+  {{- if .Values.persistence.storageClass }}
   storageClassName: {{ .Values.persistence.storageClass }}
+  {{- end }}
   resources:
     requests:
       storage: {{ .Values.persistence.data.size | default .Values.persistence.size }}
@@ -71,7 +75,9 @@ metadata:
 spec:
   accessModes:
     - {{ .Values.persistence.accessMode }}
+  {{- if .Values.persistence.storageClass }}
   storageClassName: {{ .Values.persistence.storageClass }}
+  {{- end }}
   resources:
     requests:
       storage: {{ .Values.persistence.workspace.size | default .Values.persistence.size }}

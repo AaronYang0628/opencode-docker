@@ -39,16 +39,20 @@ spec:
             pathType: {{ .pathType }}
             backend:
               service:
-                {{- if .backend.name }}
+                {{- if and .backend .backend.name }}
                 name: {{ .backend.name }}
                 {{- else }}
                 name: {{ include "opencode.fullname" $ }}
                 {{- end }}
                 port:
+                  {{- if and .backend .backend.port }}
                   {{- if .backend.port.number }}
                   number: {{ .backend.port.number }}
                   {{- else if .backend.port.name }}
                   name: {{ .backend.port.name }}
+                  {{- else }}
+                  number: {{ $.Values.service.port }}
+                  {{- end }}
                   {{- else }}
                   number: {{ $.Values.service.port }}
                   {{- end }}

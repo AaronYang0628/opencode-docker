@@ -5,6 +5,12 @@ image:
   pullPolicy: IfNotPresent
   tag: "latest"
 
+# Container command and args
+# Default: run opencode in serve mode (REST API)
+# To use TUI mode instead, set command: ["opencode"] and args: []
+command: ["opencode"]
+args: ["serve", "--port", "4000", "--hostname", "0.0.0.0"]
+
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
@@ -286,9 +292,12 @@ affinity: {}
 probes:
   liveness:
     enabled: true
-    httpGet:
-      path: /health
-      port: http
+    # Use tcpSocket by default (more reliable than HTTP /health)
+    # To use HTTP probe instead, comment out tcpSocket and uncomment httpGet
+    tcpSocket:
+      port: 4000
+    # httpGet:
+    #   path: /health
     initialDelaySeconds: 30
     periodSeconds: 10
     timeoutSeconds: 5
@@ -297,9 +306,12 @@ probes:
 
   readiness:
     enabled: true
-    httpGet:
-      path: /health
-      port: http
+    # Use tcpSocket by default (more reliable than HTTP /health)
+    # To use HTTP probe instead, comment out tcpSocket and uncomment httpGet
+    tcpSocket:
+      port: 4000
+    # httpGet:
+    #   path: /health
     initialDelaySeconds: 10
     periodSeconds: 5
     timeoutSeconds: 3
@@ -308,9 +320,12 @@ probes:
 
   startup:
     enabled: true
-    httpGet:
-      path: /health
-      port: http
+    # Use tcpSocket by default (more reliable than HTTP /health)
+    # To use HTTP probe instead, comment out tcpSocket and uncomment httpGet
+    tcpSocket:
+      port: 4000
+    # httpGet:
+    #   path: /health
     initialDelaySeconds: 5
     periodSeconds: 5
     timeoutSeconds: 3

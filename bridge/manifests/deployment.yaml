@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opencode-bridge
+  namespace: opencode
+  labels:
+    app: opencode-bridge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opencode-bridge
+  template:
+    metadata:
+      labels:
+        app: opencode-bridge
+    spec:
+      containers:
+        - name: opencode-bridge
+          image: crpi-wixjy6gci86ms14e.cn-hongkong.personal.cr.aliyuncs.com/ay-dev/opencode-bridge:v20260310
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 3100
+              name: http
+          env:
+            - name: OPENCODE_BASE
+              value: "http://opencode.opencode.svc.cluster.local:4000"
+            - name: DEFAULT_MODEL
+              value: "zzz/claude-sonnet-4-5-20250929-thinking"
+            - name: BRIDGE_PORT
+              value: "3100"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3100
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3100
+            initialDelaySeconds: 5
+            periodSeconds: 10

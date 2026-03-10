@@ -52,6 +52,14 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}
@@ -64,9 +72,14 @@ spec:
             {{- end }}
           {{- if .Values.probes.liveness.enabled }}
           livenessProbe:
+            {{- if .Values.probes.liveness.httpGet }}
             httpGet:
               path: {{ .Values.probes.liveness.httpGet.path }}
               port: http
+            {{- else if .Values.probes.liveness.tcpSocket }}
+            tcpSocket:
+              port: {{ .Values.probes.liveness.tcpSocket.port }}
+            {{- end }}
             initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
             timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
@@ -75,9 +88,14 @@ spec:
           {{- end }}
           {{- if .Values.probes.readiness.enabled }}
           readinessProbe:
+            {{- if .Values.probes.readiness.httpGet }}
             httpGet:
               path: {{ .Values.probes.readiness.httpGet.path }}
               port: http
+            {{- else if .Values.probes.readiness.tcpSocket }}
+            tcpSocket:
+              port: {{ .Values.probes.readiness.tcpSocket.port }}
+            {{- end }}
             initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
             timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
@@ -86,9 +104,14 @@ spec:
           {{- end }}
           {{- if .Values.probes.startup.enabled }}
           startupProbe:
+            {{- if .Values.probes.startup.httpGet }}
             httpGet:
               path: {{ .Values.probes.startup.httpGet.path }}
               port: http
+            {{- else if .Values.probes.startup.tcpSocket }}
+            tcpSocket:
+              port: {{ .Values.probes.startup.tcpSocket.port }}
+            {{- end }}
             initialDelaySeconds: {{ .Values.probes.startup.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.startup.periodSeconds }}
             timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
