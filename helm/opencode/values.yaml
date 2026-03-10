@@ -258,14 +258,17 @@ persistence:
     enabled: true
     existingClaim: ""  # Use existing PVC (if set, will not create a new one)
     size: null  # Uses persistence.size if null
+    storageClass: null  # Uses persistence.storageClass if null
   data:
     enabled: true
     existingClaim: ""  # Use existing PVC (if set, will not create a new one)
     size: null  # Uses persistence.size if null
+    storageClass: null  # Uses persistence.storageClass if null
   workspace:
     enabled: true
     existingClaim: ""  # Use existing PVC (if set, will not create a new one)
     size: null  # Uses persistence.size if null
+    storageClass: null  # Uses persistence.storageClass if null
 
 resources:
   limits:
