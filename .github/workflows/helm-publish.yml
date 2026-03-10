@@ -24,12 +24,17 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
+  REPO_OWNER: ${{ github.repository_owner }}
 
 jobs:
   publish-helm-chart:
     name: Publish Helm Chart to GHCR
     runs-on: ubuntu-latest
+    env:
+      REPO_OWNER_LOWER: ${{ github.repository_owner }}
     steps:
+      - name: Set lowercase owner
+        run: echo "REPO_OWNER_LOWER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
@@ -51,7 +56,7 @@ jobs:
         id: check_changes
         run: |
           # Check if chart exists in GHCR
-          CHART_EXISTS=$(helm search repo ${{ env.REGISTRY }}/${{ github.repository_owner }}/opencode --versions | grep -c ${{ steps.current_version.outputs.current_version }} || echo "0")
+          CHART_EXISTS=$(helm search repo ${{ env.REGISTRY }}/${{ github.REPO_OWNER_LOWER }}/opencode --versions | grep -c ${{ steps.current_version.outputs.current_version }} || echo "0")
 
           if [ "$CHART_EXISTS" -eq 0 ]; then
             echo "First release or new version, will publish"
@@ -184,7 +189,7 @@ jobs:
         if: steps.check_changes.outputs.has_changes == 'true' || github.event_name == 'workflow_dispatch'
         run: |
           VERSION="${{ steps.new_version.outputs.new_version }}"
-          CHART_PATH="oci://${{ env.REGISTRY }}/${{ github.repository_owner }}"
+          CHART_PATH="oci://${{ env.REGISTRY }}/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
 
           # Package and push the chart
           cd helm/opencode
