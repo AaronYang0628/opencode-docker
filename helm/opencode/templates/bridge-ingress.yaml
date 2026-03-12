@@ -28,13 +28,13 @@ spec:
       http:
         paths:
           {{- range .paths }}
-       - path: {{ .path }}
-         pathType: {{ .pathType }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
             backend:
-            service:
-        name: {{ include "opencode.bridge.fullname" $ }}
-            port:
-        number: {{ $.Values.bridge.service.port }}
+              service:
+                name: {{ include "opencode.bridge.fullname" $ }}
+                port:
+                  number: {{ $.Values.bridge.service.port }}
           {{- end }}
     {{- end }}
   {{- with .Values.bridge.ingress.tls }}

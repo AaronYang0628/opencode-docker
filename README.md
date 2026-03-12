@@ -109,8 +109,21 @@ ingress:
   hosts:
     - host: opencode.example.com
       paths:
-        - path: /
+      - path: /
           pathType: Prefix
+
+# Bridge service (optional) - API compatibility layer
+bridge:
+  enabled: false
+  image:
+    repository: your-registry/opencode-bridge
+    tag: "latest"
+  service:
+    port: 3100
+  ingress:
+    enabled: false
+    hosts:
+      - host: opencode-bridge.example.com
 
 # Resources
 resources:
@@ -196,6 +209,73 @@ The container follows security best practices:
 ---
 
 ## Advanced Helm Configuration
+
+### Bridge Service (Optional)
+
+The Helm chart includes an optional Bridge service that provides an API compatibility layer for OpenCode:
+
+```yaml
+bridge:
+  enabled: true
+
+  image:
+    repository: your-registry/opencode-bridge
+    tag: "v20260310"
+    pullPolicy: Always
+
+  # Environment variables
+  env:
+    opencodeBase: ""  # Auto-configured to point to main OpenCode service
+    defaultModel: "zzz/claude-sonnet-4-5-20250929-thinking"
+    bridgePort: "3100"
+
+  # Service configuration
+  service:
+    type: ClusterIP
+    port: 3100
+
+  # Ingress (optional)
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: self-signed-ca-issuer
+      nginx.ingress.kubernetes.io/proxy-connect-timeout: "300"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+      nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    hosts:
+      - host: opencode-bridge.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: opencode-bridge-tls
+     hosts:
+          - opencode-bridge.example.com
+
+  # Resources
+  resources:
+    limits:
+      cpu: 500m
+    memory: 256Mi
+    requests:
+   cpu: 100m
+      memory: 128Mi
+
+  # Health probes
+  probes:
+    liveness:
+      enabled: true
+      httpGet:
+        path: /health
+        port: 3100
+    readiness:
+      enabled: true
+      httpGet:
+      path: /health
+        port: 3100
+```
 
 ### Gateway API Support
 
