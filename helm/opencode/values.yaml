@@ -334,3 +334,96 @@ probes:
     timeoutSeconds: 3
     successThreshold: 1
     failureThreshold: 30
+
+# Bridge configuration
+bridge:
+  enabled: false
+
+  image:
+    repository: crpi-wixjy6gci86ms14e.cn-hongkong.personal.cr.aliyuncs.com/ay-dev/opencode-bridge
+    pullPolicy: Always
+    tag: "v20260310"
+
+  # Bridge labels and annotations (in addition to global labels/annotations)
+  deployment:
+    labels: {}
+    annotations: {}
+
+  # Pod labels and annotations (in addition to global labels/annotations)
+  pod:
+    labels: {}
+    annotations: {}
+
+  # Environment variables
+  env:
+    # OpenCode base URL (defaults to the main opencode service)
+    opencodeBase: ""  # If empty, will use: http://{{ include "opencode.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+    defaultModel: "zzz/claude-sonnet-4-5-20250929-thinking"
+    bridgePort: "3100"
+
+  # Additional environment variables
+  extraEnv: []
+
+  service:
+    type: ClusterIP
+    port: 3100
+    # Service labels and annotations (in addition to global labels/annotations)
+    labels: {}
+    annotations: {}
+
+  ingress:
+    enabled: false
+    className: "nginx"
+    # Ingress labels and annotations (in addition to global labels/annotations)
+    labels: {}
+    annotations:
+      cert-manager.io/cluster-issuer: self-signed-ca-issuer
+      nginx.ingress.kubernetes.io/proxy-connect-timeout: "300"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+      nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    hosts:
+      - host: opencode-bridge.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: opencode-bridge-tls
+        hosts:
+          - opencode-bridge.example.com
+
+  resources:
+    limits:
+      cpu: 500m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+  # Probes configuration
+  probes:
+    liveness:
+      enabled: true
+      httpGet:
+        path: /health
+        port: 3100
+      initialDelaySeconds: 5
+      periodSeconds: 30
+      timeoutSeconds: 5
+      successThreshold: 1
+      failureThreshold: 3
+
+    readiness:
+      enabled: true
+      httpGet:
+        path: /health
+        port: 3100
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 3
+      successThreshold: 1
+      failureThreshold: 3
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}

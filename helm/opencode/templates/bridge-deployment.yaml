@@ -1,0 +1,109 @@
+{{- if .Values.bridge.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "opencode.bridge.fullname" . }}
+  labels:
+    {{- include "opencode.bridge.labels" . | nindent 4 }}
+    {{- with .Values.globalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with .Values.bridge.deployment.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with or .Values.globalAnnotations .Values.bridge.deployment.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "opencode.bridge.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "opencode.bridge.selectorLabels" . | nindent 8 }}
+        {{- with .Values.globalLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.bridge.pod.labels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- with .Values.globalAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.bridge.pod.annotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: opencode-bridge
+          image: "{{ .Values.bridge.image.repository }}:{{ .Values.bridge.image.tag }}"
+          imagePullPolicy: {{ .Values.bridge.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.bridge.service.port }}
+              protocol: TCP
+          env:
+            - name: OPENCODE_BASE
+              value: {{ .Values.bridge.env.opencodeBase | default (printf "http://%s.%s.svc.cluster.local:%d" (include "opencode.fullname" .) .Release.Namespace (.Values.service.port | int)) | quote }}
+            - name: DEFAULT_MODEL
+              value: {{ .Values.bridge.env.defaultModel | quote }}
+            - name: BRIDGE_PORT
+              value: {{ .Values.bridge.env.bridgePort | quote }}
+            {{- with .Values.bridge.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.bridge.probes.liveness.enabled }}
+          livenessProbe:
+            {{- if .Values.bridge.probes.liveness.httpGet }}
+            httpGet:
+              path: {{ .Values.bridge.probes.liveness.httpGet.path }}
+              port: {{ .Values.bridge.probes.liveness.httpGet.port }}
+            {{- else if .Values.bridge.probes.liveness.tcpSocket }}
+            tcpSocket:
+              port: {{ .Values.bridge.probes.liveness.tcpSocket.port }}
+            {{- end }}
+            initialDelaySeconds: {{ .Values.bridge.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.bridge.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.bridge.probes.liveness.timeoutSeconds }}
+            successThreshold: {{ .Values.bridge.probes.liveness.successThreshold }}
+            failureThreshold: {{ .Values.bridge.probes.liveness.failureThreshold }}
+          {{- end }}
+          {{- if .Values.bridge.probes.readiness.enabled }}
+          readinessProbe:
+            {{- if .Values.bridge.probes.readiness.httpGet }}
+            httpGet:
+              path: {{ .Values.bridge.probes.readiness.httpGet.path }}
+              port: {{ .Values.bridge.probes.readiness.httpGet.port }}
+            {{- else if .Values.bridge.probes.readiness.tcpSocket }}
+            tcpSocket:
+              port: {{ .Values.bridge.probes.readiness.tcpSocket.port }}
+            {{- end }}
+            initialDelaySeconds: {{ .Values.bridge.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.bridge.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.bridge.probes.readiness.timeoutSeconds }}
+            successThreshold: {{ .Values.bridge.probes.readiness.successThreshold }}
+            failureThreshold: {{ .Values.bridge.probes.readiness.failureThreshold }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.bridge.resources | nindent 12 }}
+      {{- with .Values.bridge.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.bridge.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.bridge.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

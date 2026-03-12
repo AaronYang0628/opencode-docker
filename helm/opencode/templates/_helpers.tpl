@@ -58,3 +58,31 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{/*
+Bridge fullname
+*/}}
+{{- define "opencode.bridge.fullname" -}}
+{{- printf "%s-bridge" (include "opencode.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Bridge labels
+*/}}
+{{- define "opencode.bridge.labels" -}}
+helm.sh/chart: {{ include "opencode.chart" . }}
+{{ include "opencode.bridge.selectorLabels" . }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/component: bridge
+{{- end }}
+
+{{/*
+Bridge selector labels
+*/}}
+{{- define "opencode.bridge.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "opencode.name" . }}-bridge
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}

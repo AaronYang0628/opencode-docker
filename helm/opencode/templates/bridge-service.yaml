@@ -1,0 +1,30 @@
+{{- if .Values.bridge.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "opencode.bridge.fullname" . }}
+  labels:
+    {{- include "opencode.bridge.labels" . | nindent 4 }}
+    {{- with .Values.globalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with .Values.bridge.service.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    {{- with .Values.globalAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with .Values.bridge.service.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  type: {{ .Values.bridge.service.type }}
+  ports:
+    - port: {{ .Values.bridge.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "opencode.bridge.selectorLabels" . | nindent 4 }}
+{{- end }}
