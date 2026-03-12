@@ -15,6 +15,6 @@ sources:
   - https://github.com/fluxbase-eu/opencode-docker
 maintainers:
   - name: fluxbase-eu
-  url: https://github.com/fluxbase-eu
+    url: https://github.com/fluxbase-eu
   - name: AaronYang
     url: https://github.com/AaronYang0628
