@@ -420,6 +420,7 @@ For production deployments, implement a backup strategy for persistent data:
 ```bash
 # Build Docker image
 docker build -t opencode-local .
+podman build -t crpi-wixjy6gci86ms14e.cn-hongkong.personal.cr.aliyuncs.com/ay-dev/opencode-docker:v20260316 .
 
 # Build and test with Docker Compose
 docker-compose up --build

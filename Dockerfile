@@ -1,4 +1,4 @@
-FROM debian:bookworm-slim
+FROM m.daocloud.io/docker.io/library/debian:bookworm-slim
 
 # Install essential tools, language runtimes, and utilities
 RUN apt-get update && apt-get install -y --no-install-recommends \
