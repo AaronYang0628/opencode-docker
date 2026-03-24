@@ -25,10 +25,46 @@ services:
       retries: 3
       start_period: 40s
 
+  bridge:
+    build:
+      context: ./bridge
+    container_name: opencode-bridge
+    ports:
+      - "${BRIDGE_PORT:-3100}:3100"
+    environment:
+      - OPENCODE_BASE=http://opencode:4000
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-openai/gpt-5.3-codex-spark}
+      - BRIDGE_PORT=3100
+    depends_on:
+      opencode:
+        condition: service_healthy
+    restart: unless-stopped
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: n8n
+    ports:
+      - "${N8N_PORT:-5678}:5678"
+    environment:
+      - N8N_HOST=${N8N_HOST:-localhost}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - WEBHOOK_URL=${N8N_WEBHOOK_URL:-http://localhost:5678/}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY:-change-me-in-env}
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE:-UTC}
+    volumes:
+      - n8n-data:/home/node/.n8n
+    depends_on:
+      bridge:
+        condition: service_started
+    restart: unless-stopped
+
 volumes:
   opencode-config:
     driver: local
   opencode-data:
     driver: local
   opencode-workspace:
+    driver: local
+  n8n-data:
     driver: local

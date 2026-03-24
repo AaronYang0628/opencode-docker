@@ -34,10 +34,11 @@ docker run -p 4000:4000 \
 git clone https://github.com/fluxbase-eu/opencode-docker.git
 cd opencode-docker
 
-# Start OpenCode
+# Start OpenCode + Bridge + n8n
 docker-compose up -d
 
-# Access at http://localhost:4000
+# Access OpenCode at http://localhost:4000
+# Access n8n at http://localhost:5678
 ```
 
 ### Kubernetes / Helm
@@ -48,6 +49,44 @@ helm install opencode oci://ghcr.io/fluxbase-eu/opencode
 
 # Or install from local directory
 helm install opencode ./helm/opencode
+```
+
+---
+
+## n8n Streaming Setup (OpenCode)
+
+The bridge now exposes OpenAI-compatible endpoints so n8n can use OpenCode as a chat model with streaming output:
+
+- `POST /v1/chat/completions`
+- `GET /v1/models`
+
+### Why this works
+
+Use n8n's model path (Chat Trigger/Webhook streaming + OpenAI Chat Model), not an Agent HTTP tool call. Tool calls typically buffer until completion.
+
+### n8n configuration
+
+1. In n8n, create an OpenAI credential.
+2. Set the base URL to `http://opencode-bridge:3100/v1` (inside Docker network) or `http://localhost:3100/v1` (from host).
+3. API key can be any non-empty string unless you add auth in front of bridge.
+4. Build workflow using:
+   - `Chat Trigger` with `Response Mode = Streaming`
+   - `AI Agent` (or direct chain)
+   - `OpenAI Chat Model` using the bridge base URL
+
+### Quick API test
+
+```bash
+curl -N http://localhost:3100/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer local-test" \
+  -d '{
+    "model": "openai/gpt-5.3-codex-spark",
+    "stream": true,
+    "messages": [
+      {"role": "user", "content": "用三句话介绍一下你"}
+    ]
+  }'
 ```
 
 ---
@@ -71,6 +110,10 @@ Only a few container-level environment variables are available:
 |----------|-------------|---------|
 | `OPENCODE_PORT` | Port to listen on | `4000` |
 | `OPENCODE_SERVER_PASSWORD` | Optional password for authentication | (none) |
+| `BRIDGE_PORT` | OpenCode bridge port | `3100` |
+| `DEFAULT_MODEL` | Bridge default model | `openai/gpt-5.3-codex-spark` |
+| `N8N_PORT` | n8n web UI port | `5678` |
+| `N8N_ENCRYPTION_KEY` | n8n encryption key (required in production) | `change-me-in-env` |
 
 **Note:** API keys and model configuration are configured through the OpenCode UI, not environment variables.
 
@@ -84,6 +127,15 @@ Create a `.env` file in the repository root:
 
 # Custom port (default: 4000)
 # OPENCODE_PORT=4000
+
+# Bridge
+# BRIDGE_PORT=3100
+# DEFAULT_MODEL=openai/gpt-5.3-codex-spark
+
+# n8n
+# N8N_PORT=5678
+# N8N_ENCRYPTION_KEY=replace-with-a-long-random-string
+# N8N_WEBHOOK_URL=http://localhost:5678/
 ```
 
 Then start with:

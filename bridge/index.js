@@ -40,8 +40,21 @@ function fetchJSON(url, options = {}) {
       let data = "";
       res.on("data", (chunk) => (data += chunk));
       res.on("end", () => {
-        try { resolve(JSON.parse(data)); }
-        catch { resolve(data); }
+        let parsed = data;
+        try { parsed = JSON.parse(data); }
+        catch { /* keep raw string */ }
+
+        if (options.rejectOnHTTPError && res.statusCode >= 400) {
+          const message =
+            (parsed && parsed.error) ||
+            (parsed && parsed.message) ||
+            data ||
+            `Request failed with status ${res.statusCode}`;
+          reject(new Error(`HTTP ${res.statusCode}: ${message}`));
+          return;
+        }
+
+        resolve(parsed);
       });
     });
     req.on("error", reject);
@@ -63,12 +76,571 @@ function extractText(messageResponse) {
     .join("");
 }
 
+function writeSSE(res, event, payload) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+function createSSEParser(onEvent) {
+  let buffer = "";
+  let eventName = "message";
+  let dataLines = [];
+
+  return (chunk) => {
+    buffer += chunk.toString("utf8");
+
+    while (true) {
+      const newlineIndex = buffer.indexOf("\n");
+      if (newlineIndex === -1) break;
+
+      let line = buffer.slice(0, newlineIndex);
+      buffer = buffer.slice(newlineIndex + 1);
+      if (line.endsWith("\r")) line = line.slice(0, -1);
+
+      // 空行表示一个 SSE 事件结束
+      if (line === "") {
+        if (dataLines.length > 0) {
+          const raw = dataLines.join("\n");
+          let data = raw;
+          try { data = JSON.parse(raw); }
+          catch { /* keep raw string */ }
+          onEvent({ event: eventName, data });
+        }
+        eventName = "message";
+        dataLines = [];
+        continue;
+      }
+
+      if (line.startsWith(":")) continue;
+      if (line.startsWith("event:")) {
+        eventName = line.slice(6).trim() || "message";
+        continue;
+      }
+      if (line.startsWith("data:")) {
+        dataLines.push(line.slice(5).trimStart());
+      }
+    }
+  };
+}
+
+function normalizeInputString(value) {
+  if (typeof value !== "string") return value;
+  // n8n 表达式模式里经常会把值写成 =xxx
+  return value.startsWith("=") ? value.slice(1) : value;
+}
+
+function toPromptText(value) {
+  const v = normalizeInputString(value);
+  if (typeof v === "string") return v;
+  if (v == null) return "";
+  if (typeof v === "object") {
+    const keys = ["prompt", "text", "message", "content", "query"];
+    for (const k of keys) {
+      if (typeof v[k] === "string") return normalizeInputString(v[k]);
+    }
+  }
+  return String(v);
+}
+
+function createMessageID() {
+  return `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function createCompletionID() {
+  return `chatcmpl_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function writeOpenAIStreamChunk(res, payload) {
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+function writeOpenAIStreamDone(res) {
+  res.write("data: [DONE]\n\n");
+}
+
+function messageContentToText(content) {
+  if (typeof content === "string") return content;
+  if (content == null) return "";
+
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (!item || typeof item !== "object") return "";
+        if (typeof item.text === "string") return item.text;
+        if (typeof item.input_text === "string") return item.input_text;
+        if (typeof item.output_text === "string") return item.output_text;
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  if (typeof content === "object") {
+    if (typeof content.text === "string") return content.text;
+    if (typeof content.input_text === "string") return content.input_text;
+    if (typeof content.output_text === "string") return content.output_text;
+  }
+
+  return "";
+}
+
+function buildPromptFromMessages(messages) {
+  if (!Array.isArray(messages)) return "";
+
+  const systemBlocks = [];
+  let lastUserText = "";
+  let lastFallbackText = "";
+
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+    const role = typeof message.role === "string" ? message.role : "user";
+    const text = messageContentToText(message.content);
+    if (!text) continue;
+
+    if (role === "system" || role === "developer") {
+      systemBlocks.push(text);
+      continue;
+    }
+
+    if (role === "user") {
+      lastUserText = text;
+      continue;
+    }
+
+    // 兜底：如果没有 user 消息，至少使用最后一条可读文本
+    lastFallbackText = text;
+  }
+
+  const mainText = lastUserText || lastFallbackText;
+  if (!mainText) {
+    return systemBlocks.join("\n\n");
+  }
+
+  if (systemBlocks.length === 0) {
+    return mainText;
+  }
+
+  return `${systemBlocks.join("\n\n")}\n\n${mainText}`;
+}
+
+function extractOpenAIInput(payload = {}) {
+  const root = payload && typeof payload === "object" ? payload : {};
+  const metadata = root.metadata && typeof root.metadata === "object" ? root.metadata : {};
+
+  const promptFromMessages = buildPromptFromMessages(root.messages);
+  const promptRaw = root.prompt ?? root.input ?? root.query ?? promptFromMessages;
+
+  const sessionIdRaw =
+    root.sessionId ??
+    root.session_id ??
+    root.conversationId ??
+    root.conversation_id ??
+    root.chatId ??
+    root.chat_id ??
+    metadata.sessionId ??
+    metadata.session_id ??
+    root.user;
+
+  return {
+    prompt: toPromptText(promptRaw),
+    n8nSessionId: normalizeInputString(sessionIdRaw),
+    model: normalizeInputString(root.model),
+  };
+}
+
+function buildOpenAIChatCompletion({ completionId, created, model, content }) {
+  return {
+    id: completionId,
+    object: "chat.completion",
+    created,
+    model,
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content },
+        finish_reason: "stop",
+      },
+    ],
+    usage: {
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
+    },
+  };
+}
+
+function extractModelIdFromPath(normalizedPath) {
+  const marker = "/models/";
+  const idx = normalizedPath.lastIndexOf(marker);
+  if (idx === -1) return DEFAULT_MODEL;
+
+  const raw = normalizedPath.slice(idx + marker.length);
+  if (!raw) return DEFAULT_MODEL;
+
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+function extractN8nInput(payload = {}) {
+  const root = payload && typeof payload === "object" ? payload : {};
+  const data = root.data && typeof root.data === "object" ? root.data : {};
+
+  const promptRaw =
+    root.prompt ??
+    root.input ??
+    root.query ??
+    root.text ??
+    root.message ??
+    root.user_input ??
+    data.prompt ??
+    data.input ??
+    data.query ??
+    data.text ??
+    data.message ??
+    data.user_input;
+
+  const sessionIdRaw =
+    root.sessionId ??
+    root.session_id ??
+    root.chatId ??
+    root.chat_id ??
+    data.sessionId ??
+    data.session_id ??
+    data.chatId ??
+    data.chat_id;
+
+  const modelRaw = root.model ?? root.modelId ?? data.model ?? data.modelId;
+
+  return {
+    prompt: toPromptText(promptRaw),
+    n8nSessionId: normalizeInputString(sessionIdRaw),
+    model: normalizeInputString(modelRaw),
+  };
+}
+
+async function resolveOpencodeSession(n8nSessionId, model, rejectOnHTTPError = false) {
+  let opencodeSessionId = sessionMap.get(n8nSessionId);
+  if (!opencodeSessionId) {
+    const session = await fetchJSON(`${OPENCODE_BASE}/session`, {
+      method: "POST",
+      body: { model: model || DEFAULT_MODEL },
+      rejectOnHTTPError,
+    });
+    opencodeSessionId = session.id;
+    if (n8nSessionId) sessionMap.set(n8nSessionId, opencodeSessionId);
+    console.log(`[新建Session] n8n:${n8nSessionId} → opencode:${opencodeSessionId}`);
+  } else {
+    console.log(`[复用Session] opencode:${opencodeSessionId}`);
+  }
+  return opencodeSessionId;
+}
+
+async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, options = {}) {
+  const mode = options.mode === "openai" ? "openai" : "bridge";
+  const completionId = options.completionId || createCompletionID();
+  const created = options.created || Math.floor(Date.now() / 1000);
+  const responseModel = options.responseModel || model || DEFAULT_MODEL;
+
+  if (!prompt) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ success: false, error: "prompt is required" }));
+    return;
+  }
+
+  let opencodeSessionId;
+  try {
+    opencodeSessionId = await resolveOpencodeSession(n8nSessionId, model, true);
+  } catch (err) {
+    res.writeHead(500, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ success: false, error: err.message }));
+    return;
+  }
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  res.write(`: connected\n\n`);
+  if (mode === "bridge") {
+    writeSSE(res, "meta", { success: true, sessionId: opencodeSessionId });
+  } else {
+    writeOpenAIStreamChunk(res, {
+      id: completionId,
+      object: "chat.completion.chunk",
+      created,
+      model: responseModel,
+      choices: [
+        {
+          index: 0,
+          delta: { role: "assistant" },
+          finish_reason: null,
+        },
+      ],
+    });
+  }
+
+  let closed = false;
+  let eventReq = null;
+  let fullText = "";
+  let assistantMessageID = null;
+  const userMessageID = createMessageID();
+  let promptAccepted = false;
+
+  const cleanup = () => {
+    if (eventReq) {
+      eventReq.destroy();
+      eventReq = null;
+    }
+  };
+
+  const closeStream = () => {
+    if (closed) return;
+    res.end();
+    closed = true;
+    cleanup();
+  };
+
+  const emitDelta = (text) => {
+    if (!text) return;
+    if (mode === "bridge") {
+      writeSSE(res, "delta", { text, sessionId: opencodeSessionId });
+      return;
+    }
+
+    writeOpenAIStreamChunk(res, {
+      id: completionId,
+      object: "chat.completion.chunk",
+      created,
+      model: responseModel,
+      choices: [
+        {
+          index: 0,
+          delta: { content: text },
+          finish_reason: null,
+        },
+      ],
+    });
+  };
+
+  const emitDone = () => {
+    if (mode === "bridge") {
+      writeSSE(res, "done", {
+        success: true,
+        sessionId: opencodeSessionId,
+        result: fullText,
+      });
+      return;
+    }
+
+    writeOpenAIStreamChunk(res, {
+      id: completionId,
+      object: "chat.completion.chunk",
+      created,
+      model: responseModel,
+      choices: [
+        {
+          index: 0,
+          delta: {},
+          finish_reason: "stop",
+        },
+      ],
+    });
+    writeOpenAIStreamDone(res);
+  };
+
+  const emitError = (message) => {
+    if (mode === "bridge") {
+      writeSSE(res, "error", { success: false, sessionId: opencodeSessionId, error: message });
+      return;
+    }
+
+    writeOpenAIStreamChunk(res, {
+      error: {
+        message,
+        type: "server_error",
+      },
+    });
+    writeOpenAIStreamDone(res);
+  };
+
+  req.on("close", () => {
+    closed = true;
+    cleanup();
+  });
+
+  try {
+    let resolveStreamReady;
+    let rejectStreamReady;
+    const streamReady = new Promise((resolve, reject) => {
+      resolveStreamReady = resolve;
+      rejectStreamReady = reject;
+    });
+
+    const eventURL = new URL(`${OPENCODE_BASE}/event`);
+    const eventOptions = {
+      hostname: eventURL.hostname,
+      port: eventURL.port || 80,
+      path: eventURL.pathname + eventURL.search,
+      method: "GET",
+      headers: { Accept: "text/event-stream" },
+    };
+
+    eventReq = http.request(eventOptions, (eventRes) => {
+      if (eventRes.statusCode >= 400) {
+        let upstreamError = "";
+        eventRes.on("data", (chunk) => (upstreamError += chunk.toString("utf8")));
+          eventRes.on("end", () => {
+            rejectStreamReady(new Error(`event stream HTTP ${eventRes.statusCode}: ${upstreamError || "upstream error"}`));
+            if (!closed) {
+              emitError(`event stream HTTP ${eventRes.statusCode}: ${upstreamError || "upstream error"}`);
+              closeStream();
+            }
+          });
+          return;
+        }
+
+      resolveStreamReady();
+
+      const parseChunk = createSSEParser(({ data }) => {
+        if (closed || !data || typeof data !== "object") return;
+
+        const event = data;
+        const type = event.type;
+        const props = event.properties || {};
+
+        if (type === "message.updated") {
+          const info = props.info || {};
+          if (info.sessionID !== opencodeSessionId) return;
+
+          if (info.role === "user" && info.id === userMessageID) {
+            promptAccepted = true;
+            return;
+          }
+
+          if (info.role === "assistant" && info.parentID === userMessageID) {
+            assistantMessageID = info.id;
+            if (info.time && info.time.completed) {
+              emitDone();
+              closeStream();
+            }
+            return;
+          }
+
+          if (assistantMessageID && info.id === assistantMessageID && info.time && info.time.completed) {
+            emitDone();
+            closeStream();
+          }
+          return;
+        }
+
+        if (type === "message.part.updated") {
+          const part = props.part || {};
+          if (part.sessionID !== opencodeSessionId || part.type !== "text") return;
+          if (assistantMessageID && part.messageID !== assistantMessageID) return;
+
+          let delta = typeof props.delta === "string" ? props.delta : "";
+          if (!delta && typeof part.text === "string" && part.text.length > fullText.length) {
+            if (part.text.startsWith(fullText)) {
+              delta = part.text.slice(fullText.length);
+            } else {
+              delta = part.text;
+            }
+          }
+
+          if (delta) {
+            fullText += delta;
+            emitDelta(delta);
+          }
+          return;
+        }
+
+        if (type === "session.status" && props.sessionID === opencodeSessionId) {
+          if (props.status && props.status.type === "idle" && promptAccepted) {
+            emitDone();
+            closeStream();
+          }
+          return;
+        }
+
+        if (type === "session.idle" && props.sessionID === opencodeSessionId && promptAccepted) {
+          emitDone();
+          closeStream();
+          return;
+        }
+
+        if (type === "session.error") {
+          if (!props.sessionID || props.sessionID === opencodeSessionId) {
+            const err = props.error;
+            const message =
+              (err && err.data && err.data.message) ||
+              (err && err.name) ||
+              "session error";
+            emitError(message);
+            closeStream();
+          }
+        }
+      });
+
+      eventRes.on("data", parseChunk);
+      eventRes.on("end", () => {
+        if (!closed) {
+          emitError("upstream event stream ended unexpectedly");
+          closeStream();
+        }
+      });
+    });
+
+    eventReq.on("error", (err) => {
+      rejectStreamReady(err);
+      if (!closed) {
+        emitError(`event stream error: ${err.message}`);
+        closeStream();
+      }
+    });
+
+    eventReq.setTimeout(300000, () => {
+      eventReq.destroy(new Error("event stream timeout"));
+    });
+
+    eventReq.end();
+
+    await Promise.race([
+      streamReady,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("event stream connect timeout")), 10000)),
+    ]);
+
+    console.log(`[流式发送消息] ${prompt.slice(0, 80)}`);
+    await fetchJSON(`${OPENCODE_BASE}/session/${opencodeSessionId}/prompt_async`, {
+      method: "POST",
+      body: { messageID: userMessageID, parts: [{ type: "text", text: prompt }] },
+      rejectOnHTTPError: true,
+    });
+  } catch (err) {
+    emitError(err.message);
+    closeStream();
+  }
+}
+
 // ─── HTTP Server ──────────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
+  const requestURL = new URL(req.url, "http://localhost");
+  const pathname = requestURL.pathname;
+  const normalizedPath =
+    pathname
+      .replace(/\/{2,}/g, "/")
+      .replace(/\/$/, "") || "/";
+  const hasPathSuffix = (suffix) => normalizedPath === suffix || normalizedPath.endsWith(suffix);
+
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
   if (req.method === "OPTIONS") {
     res.writeHead(204);
@@ -76,8 +648,111 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── OpenAI-compatible APIs (for n8n Chat Model) ──────────────
+  if (req.method === "GET" && (hasPathSuffix("/v1/models") || hasPathSuffix("/models"))) {
+    const modelId = DEFAULT_MODEL;
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        object: "list",
+        data: [
+          {
+            id: modelId,
+            object: "model",
+            created: 0,
+            owned_by: "opencode-bridge",
+          },
+        ],
+      })
+    );
+    return;
+  }
+
+  if (req.method === "GET" && /\/models\/.+/.test(normalizedPath)) {
+    const modelId = extractModelIdFromPath(normalizedPath);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: modelId,
+        object: "model",
+        created: 0,
+        owned_by: "opencode-bridge",
+      })
+    );
+    return;
+  }
+
+  if (req.method === "POST" && /\/chat\/completions$/.test(normalizedPath)) {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", async () => {
+      let parsed;
+      try {
+        parsed = JSON.parse(body || "{}");
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "invalid JSON body", type: "invalid_request_error" } }));
+        return;
+      }
+
+      const { prompt, n8nSessionId, model } = extractOpenAIInput(parsed);
+      if (!prompt) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "messages or prompt is required", type: "invalid_request_error" } }));
+        return;
+      }
+
+      const responseModel = model || DEFAULT_MODEL;
+      const completionId = createCompletionID();
+      const created = Math.floor(Date.now() / 1000);
+
+      if (parsed.stream === true) {
+        await handleStreamRequest(
+          req,
+          res,
+          { prompt, n8nSessionId, model: responseModel },
+          {
+            mode: "openai",
+            completionId,
+            created,
+            responseModel,
+          }
+        );
+        return;
+      }
+
+      try {
+        const opencodeSessionId = await resolveOpencodeSession(n8nSessionId, responseModel, true);
+        console.log(`[OpenAI兼容消息] ${prompt.slice(0, 80)}`);
+
+        const msgResponse = await fetchJSON(`${OPENCODE_BASE}/session/${opencodeSessionId}/message`, {
+          method: "POST",
+          body: { parts: [{ type: "text", text: prompt }] },
+          rejectOnHTTPError: true,
+        });
+
+        const result = extractText(msgResponse);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify(
+            buildOpenAIChatCompletion({
+              completionId,
+              created,
+              model: responseModel,
+              content: result,
+            })
+          )
+        );
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: err.message, type: "server_error" } }));
+      }
+    });
+    return;
+  }
+
   // ── POST /chat ────────────────────────────────────────────────
-  if (req.method === "POST" && req.url === "/chat") {
+  if (req.method === "POST" && normalizedPath === "/chat") {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", async () => {
@@ -91,6 +766,7 @@ const server = http.createServer(async (req, res) => {
           const session = await fetchJSON(`${OPENCODE_BASE}/session`, {
             method: "POST",
             body: { model: model || DEFAULT_MODEL },
+            rejectOnHTTPError: true,
           });
           opencodeSessionId = session.id;
           if (n8nSessionId) sessionMap.set(n8nSessionId, opencodeSessionId);
@@ -122,14 +798,90 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── POST /chat/n8n (tool-friendly, non-stream) ───────────────
+  if (req.method === "POST" && normalizedPath === "/chat/n8n") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", async () => {
+      let parsed;
+      try {
+        parsed = JSON.parse(body || "{}");
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "invalid JSON body" }));
+        return;
+      }
+
+      try {
+        const { prompt, n8nSessionId, model } = extractN8nInput(parsed);
+        if (!prompt) throw new Error("prompt is required");
+
+        const opencodeSessionId = await resolveOpencodeSession(n8nSessionId, model, true);
+        console.log(`[n8n工具消息] ${prompt.slice(0, 80)}`);
+
+        const msgResponse = await fetchJSON(`${OPENCODE_BASE}/session/${opencodeSessionId}/message`, {
+          method: "POST",
+          body: { parts: [{ type: "text", text: prompt }] },
+          rejectOnHTTPError: true,
+        });
+
+        const result = extractText(msgResponse);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            sessionId: opencodeSessionId,
+            output: result,
+            result,
+          })
+        );
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // ── POST /chat/stream (SSE) ───────────────────────────────────
+  if (req.method === "POST" && normalizedPath === "/chat/stream") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", async () => {
+      try {
+        const parsed = JSON.parse(body || "{}");
+        const input = extractN8nInput(parsed);
+        await handleStreamRequest(req, res, input);
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: "invalid JSON body" }));
+      }
+    });
+    return;
+  }
+
+  // ── GET /chat/n8n/stream (SSE, query params) ─────────────────
+  if (req.method === "GET" && normalizedPath === "/chat/n8n/stream") {
+    const parsed = {
+      prompt: requestURL.searchParams.get("prompt"),
+      sessionId: requestURL.searchParams.get("sessionId"),
+      session_id: requestURL.searchParams.get("session_id"),
+      model: requestURL.searchParams.get("model"),
+    };
+    const input = extractN8nInput(parsed);
+    handleStreamRequest(req, res, input);
+    return;
+  }
+
   // ── GET /health ───────────────────────────────────────────────
-  if (req.url === "/health") {
+  if (normalizedPath === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ status: "ok", sessions: sessionMap.size, opencode: OPENCODE_BASE }));
     return;
   }
 
   res.writeHead(404);
+  console.warn(`[404] ${req.method} ${pathname}`);
   res.end("Not found");
 });
 
