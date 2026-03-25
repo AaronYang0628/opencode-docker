@@ -57,6 +57,10 @@ spec:
               value: {{ .Values.bridge.env.defaultModel | quote }}
             - name: BRIDGE_PORT
               value: {{ .Values.bridge.env.bridgePort | quote }}
+            - name: OPENAI_STREAM_CHUNK_SIZE
+              value: {{ .Values.bridge.env.openaiStreamChunkSize | quote }}
+            - name: OPENAI_STREAM_CHUNK_DELAY_MS
+              value: {{ .Values.bridge.env.openaiStreamChunkDelayMs | quote }}
             {{- with .Values.bridge.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

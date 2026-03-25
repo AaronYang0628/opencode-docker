@@ -74,6 +74,11 @@ Use n8n's model path (Chat Trigger/Webhook streaming + OpenAI Chat Model), not a
    - `AI Agent` (or direct chain)
    - `OpenAI Chat Model` using the bridge base URL
 
+If upstream returns large chunks, bridge can split chunks for smoother UI streaming:
+
+- `OPENAI_STREAM_CHUNK_SIZE` (default `24`)
+- `OPENAI_STREAM_CHUNK_DELAY_MS` (default `18`)
+
 ### Quick API test
 
 ```bash
@@ -272,7 +277,7 @@ bridge:
 
   image:
     repository: your-registry/opencode-bridge
-    tag: "v20260310"
+    tag: "v20260324"
     pullPolicy: Always
 
   # Environment variables
@@ -280,6 +285,8 @@ bridge:
     opencodeBase: ""  # Auto-configured to point to main OpenCode service
     defaultModel: "zzz/claude-sonnet-4-5-20250929-thinking"
     bridgePort: "3100"
+    openaiStreamChunkSize: "24"
+    openaiStreamChunkDelayMs: "18"
 
   # Service configuration
   service:
@@ -295,6 +302,8 @@ bridge:
       nginx.ingress.kubernetes.io/proxy-connect-timeout: "300"
       nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
       nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+      nginx.ingress.kubernetes.io/proxy-buffering: "off"
+      nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
       nginx.ingress.kubernetes.io/proxy-body-size: "50m"
     hosts:
       - host: opencode-bridge.example.com

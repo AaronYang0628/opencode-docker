@@ -34,6 +34,8 @@ services:
     environment:
       - OPENCODE_BASE=http://opencode:4000
       - DEFAULT_MODEL=${DEFAULT_MODEL:-openai/gpt-5.3-codex-spark}
+      - OPENAI_STREAM_CHUNK_SIZE=${OPENAI_STREAM_CHUNK_SIZE:-24}
+      - OPENAI_STREAM_CHUNK_DELAY_MS=${OPENAI_STREAM_CHUNK_DELAY_MS:-18}
       - BRIDGE_PORT=3100
     depends_on:
       opencode:

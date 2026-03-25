@@ -342,7 +342,7 @@ bridge:
   image:
     repository: crpi-wixjy6gci86ms14e.cn-hongkong.personal.cr.aliyuncs.com/ay-dev/opencode-bridge
     pullPolicy: Always
-    tag: "v20260310"
+    tag: "v20260324"
 
   # Bridge labels and annotations (in addition to global labels/annotations)
   deployment:
@@ -360,6 +360,9 @@ bridge:
     opencodeBase: ""  # If empty, will use: http://{{ include "opencode.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
     defaultModel: "zzz/claude-sonnet-4-5-20250929-thinking"
     bridgePort: "3100"
+    # Optional stream smoothing for OpenAI-compatible SSE output
+    openaiStreamChunkSize: "24"
+    openaiStreamChunkDelayMs: "18"
 
   # Additional environment variables
   extraEnv: []
@@ -381,6 +384,8 @@ bridge:
       nginx.ingress.kubernetes.io/proxy-connect-timeout: "300"
       nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
       nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+      nginx.ingress.kubernetes.io/proxy-buffering: "off"
+      nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
       nginx.ingress.kubernetes.io/proxy-body-size: "50m"
     hosts:
       - host: opencode-bridge.example.com

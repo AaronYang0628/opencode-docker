@@ -14,6 +14,8 @@ const http = require("http");
 const OPENCODE_BASE = process.env.OPENCODE_BASE || "http://opencode.opencode.svc.cluster.local:4000";
 const BRIDGE_PORT   = parseInt(process.env.BRIDGE_PORT || "3100");
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "zzz/claude-sonnet-4-5-20250929-thinking";
+const OPENAI_STREAM_CHUNK_SIZE = Math.max(0, parseInt(process.env.OPENAI_STREAM_CHUNK_SIZE || "24", 10) || 0);
+const OPENAI_STREAM_CHUNK_DELAY_MS = Math.max(0, parseInt(process.env.OPENAI_STREAM_CHUNK_DELAY_MS || "18", 10) || 0);
 
 // N8N sessionId → OpenCode sessionId 映射（多轮对话）
 const sessionMap = new Map();
@@ -158,6 +160,20 @@ function writeOpenAIStreamDone(res) {
   res.write("data: [DONE]\n\n");
 }
 
+function splitStreamText(text, chunkSize) {
+  if (!text) return [];
+  if (!chunkSize || chunkSize <= 0) return [text];
+
+  const chars = Array.from(text);
+  if (chars.length <= chunkSize) return [text];
+
+  const parts = [];
+  for (let i = 0; i < chars.length; i += chunkSize) {
+    parts.push(chars.slice(i, i + chunkSize).join(""));
+  }
+  return parts;
+}
+
 function messageContentToText(content) {
   if (typeof content === "string") return content;
   if (content == null) return "";
@@ -266,6 +282,79 @@ function buildOpenAIChatCompletion({ completionId, created, model, content }) {
       prompt_tokens: 0,
       completion_tokens: 0,
       total_tokens: 0,
+    },
+  };
+}
+
+function createLeadingEchoFilter(prompt) {
+  const basePrompt = (prompt || "").trim();
+  const variants = [];
+  if (basePrompt) {
+    variants.push(basePrompt);
+    variants.push(`USER: ${basePrompt}`);
+    variants.push(`用户: ${basePrompt}`);
+  }
+
+  if (variants.length === 0) {
+    return {
+      apply: (text) => text,
+      flush: () => "",
+    };
+  }
+
+  let decided = false;
+  let buffer = "";
+  const maxProbeLength = Math.max(...variants.map((v) => v.length)) + 16;
+
+  const stripPrefix = (source, prefix) => {
+    const leading = source.match(/^\s*/)?.[0] || "";
+    const core = source.slice(leading.length);
+    if (!core.startsWith(prefix)) return null;
+
+    const rest = core.slice(prefix.length).replace(/^[\s\n\r:：,，。!！?？-]+/, "");
+    return leading + rest;
+  };
+
+  return {
+    apply: (text) => {
+      if (!text) return "";
+      if (decided) return text;
+
+      buffer += text;
+
+      for (const variant of variants) {
+        const stripped = stripPrefix(buffer, variant);
+        if (stripped !== null) {
+          decided = true;
+          buffer = "";
+          return stripped;
+        }
+      }
+
+      const probe = buffer.trimStart();
+      const maybePrefix = variants.some((v) => v.startsWith(probe));
+      if (!maybePrefix && probe.length >= maxProbeLength) {
+        decided = true;
+        const out = buffer;
+        buffer = "";
+        return out;
+      }
+
+      if (!maybePrefix && probe.length > 0) {
+        decided = true;
+        const out = buffer;
+        buffer = "";
+        return out;
+      }
+
+      return "";
+    },
+    flush: () => {
+      if (decided || !buffer) return "";
+      decided = true;
+      const out = buffer;
+      buffer = "";
+      return out;
     },
   };
 }
@@ -391,6 +480,20 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
   let assistantMessageID = null;
   const userMessageID = createMessageID();
   let promptAccepted = false;
+  const echoFilter = createLeadingEchoFilter(prompt);
+  let writeQueue = Promise.resolve();
+  let closeRequested = false;
+
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const enqueueWrite = (writer) => {
+    writeQueue = writeQueue
+      .then(async () => {
+        if (closed) return;
+        await writer();
+      })
+      .catch(() => {});
+    return writeQueue;
+  };
 
   const cleanup = () => {
     if (eventReq) {
@@ -400,73 +503,102 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
   };
 
   const closeStream = () => {
-    if (closed) return;
-    res.end();
-    closed = true;
-    cleanup();
+    if (closed || closeRequested) return;
+    closeRequested = true;
+    writeQueue.finally(() => {
+      if (closed) return;
+      res.end();
+      closed = true;
+      cleanup();
+    });
   };
 
   const emitDelta = (text) => {
     if (!text) return;
     if (mode === "bridge") {
-      writeSSE(res, "delta", { text, sessionId: opencodeSessionId });
-      return;
-    }
-
-    writeOpenAIStreamChunk(res, {
-      id: completionId,
-      object: "chat.completion.chunk",
-      created,
-      model: responseModel,
-      choices: [
-        {
-          index: 0,
-          delta: { content: text },
-          finish_reason: null,
-        },
-      ],
-    });
-  };
-
-  const emitDone = () => {
-    if (mode === "bridge") {
-      writeSSE(res, "done", {
-        success: true,
-        sessionId: opencodeSessionId,
-        result: fullText,
+      enqueueWrite(() => {
+        writeSSE(res, "delta", { text, sessionId: opencodeSessionId });
       });
       return;
     }
 
-    writeOpenAIStreamChunk(res, {
-      id: completionId,
-      object: "chat.completion.chunk",
-      created,
-      model: responseModel,
-      choices: [
-        {
-          index: 0,
-          delta: {},
-          finish_reason: "stop",
-        },
-      ],
+    const parts = splitStreamText(text, OPENAI_STREAM_CHUNK_SIZE);
+    parts.forEach((part, index) => {
+      enqueueWrite(async () => {
+        writeOpenAIStreamChunk(res, {
+          id: completionId,
+          object: "chat.completion.chunk",
+          created,
+          model: responseModel,
+          choices: [
+            {
+              index: 0,
+              delta: { content: part },
+              finish_reason: null,
+            },
+          ],
+        });
+
+        if (OPENAI_STREAM_CHUNK_DELAY_MS > 0 && index < parts.length - 1) {
+          await delay(OPENAI_STREAM_CHUNK_DELAY_MS);
+        }
+      });
     });
-    writeOpenAIStreamDone(res);
+  };
+
+  const emitDone = () => {
+    const tail = echoFilter.flush();
+    if (tail) {
+      fullText += tail;
+      emitDelta(tail);
+    }
+
+    if (mode === "bridge") {
+      enqueueWrite(() => {
+        writeSSE(res, "done", {
+          success: true,
+          sessionId: opencodeSessionId,
+          result: fullText,
+        });
+      });
+      return;
+    }
+
+    enqueueWrite(() => {
+      writeOpenAIStreamChunk(res, {
+        id: completionId,
+        object: "chat.completion.chunk",
+        created,
+        model: responseModel,
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            finish_reason: "stop",
+          },
+        ],
+      });
+      writeOpenAIStreamDone(res);
+    });
   };
 
   const emitError = (message) => {
     if (mode === "bridge") {
-      writeSSE(res, "error", { success: false, sessionId: opencodeSessionId, error: message });
+      enqueueWrite(() => {
+        writeSSE(res, "error", { success: false, sessionId: opencodeSessionId, error: message });
+      });
       return;
     }
 
-    writeOpenAIStreamChunk(res, {
-      error: {
-        message,
-        type: "server_error",
-      },
+    enqueueWrite(() => {
+      writeOpenAIStreamChunk(res, {
+        error: {
+          message,
+          type: "server_error",
+        },
+      });
+      writeOpenAIStreamDone(res);
     });
-    writeOpenAIStreamDone(res);
   };
 
   req.on("close", () => {
@@ -554,8 +686,10 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
           }
 
           if (delta) {
-            fullText += delta;
-            emitDelta(delta);
+            const filtered = echoFilter.apply(delta);
+            if (!filtered) return;
+            fullText += filtered;
+            emitDelta(filtered);
           }
           return;
         }
