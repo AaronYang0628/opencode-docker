@@ -131,6 +131,18 @@ spec:
             - name: workspace
               mountPath: /home/opencode/workspace
             {{- end }}
+            {{- if .Values.persistence.playbook.enabled }}
+            - name: playbook
+              mountPath: {{ .Values.persistence.playbook.mountPath | default "/home/opencode/workspace/playbook" }}
+            {{- if .Values.persistence.playbook.example.enabled }}
+            {{- range $path, $_ := .Files.Glob "files/playbook/*" }}
+            - name: playbook-example
+              mountPath: {{ printf "%s/%s" ($.Values.persistence.playbook.mountPath | default "/home/opencode/workspace/playbook") (base $path) }}
+              subPath: {{ base $path }}
+              readOnly: true
+            {{- end }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -154,6 +166,16 @@ spec:
         - name: workspace
           persistentVolumeClaim:
             claimName: {{ .Values.persistence.workspace.existingClaim | default (print (include "opencode.fullname" .) "-workspace") }}
+        {{- end }}
+        {{- if .Values.persistence.playbook.enabled }}
+        - name: playbook
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.playbook.existingClaim | default (print (include "opencode.fullname" .) "-playbook") }}
+        {{- if .Values.persistence.playbook.example.enabled }}
+        - name: playbook-example
+          configMap:
+            name: {{ include "opencode.fullname" . }}-playbook-example
+        {{- end }}
         {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}

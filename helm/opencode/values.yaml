@@ -269,6 +269,14 @@ persistence:
     existingClaim: ""  # Use existing PVC (if set, will not create a new one)
     size: null  # Uses persistence.size if null
     storageClass: null  # Uses persistence.storageClass if null
+  playbook:
+    enabled: false
+    existingClaim: ""  # Use existing PVC (if set, will not create a new one)
+    size: null  # Uses persistence.size if null
+    storageClass: null  # Uses persistence.storageClass if null
+    mountPath: /home/opencode/workspace/playbook
+    example:
+      enabled: true
 
 resources:
   limits:
@@ -363,6 +371,8 @@ bridge:
     # Optional stream smoothing for OpenAI-compatible SSE output
     openaiStreamChunkSize: "24"
     openaiStreamChunkDelayMs: "18"
+    # Optional leading echo suppression (may delay first visible tokens)
+    enableLeadingEchoFilter: "false"
 
   # Additional environment variables
   extraEnv: []

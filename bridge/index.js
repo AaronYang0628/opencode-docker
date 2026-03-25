@@ -16,6 +16,7 @@ const BRIDGE_PORT   = parseInt(process.env.BRIDGE_PORT || "3100");
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "zzz/claude-sonnet-4-5-20250929-thinking";
 const OPENAI_STREAM_CHUNK_SIZE = Math.max(0, parseInt(process.env.OPENAI_STREAM_CHUNK_SIZE || "24", 10) || 0);
 const OPENAI_STREAM_CHUNK_DELAY_MS = Math.max(0, parseInt(process.env.OPENAI_STREAM_CHUNK_DELAY_MS || "18", 10) || 0);
+const ENABLE_LEADING_ECHO_FILTER = String(process.env.ENABLE_LEADING_ECHO_FILTER || "false").toLowerCase() === "true";
 
 // N8N sessionId → OpenCode sessionId 映射（多轮对话）
 const sessionMap = new Map();
@@ -359,6 +360,13 @@ function createLeadingEchoFilter(prompt) {
   };
 }
 
+function createPassThroughFilter() {
+  return {
+    apply: (text) => text || "",
+    flush: () => "",
+  };
+}
+
 function extractModelIdFromPath(normalizedPath) {
   const marker = "/models/";
   const idx = normalizedPath.lastIndexOf(marker);
@@ -480,7 +488,7 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
   let assistantMessageID = null;
   const userMessageID = createMessageID();
   let promptAccepted = false;
-  const echoFilter = createLeadingEchoFilter(prompt);
+  const echoFilter = ENABLE_LEADING_ECHO_FILTER ? createLeadingEchoFilter(prompt) : createPassThroughFilter();
   let writeQueue = Promise.resolve();
   let closeRequested = false;
 
@@ -674,6 +682,12 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
         if (type === "message.part.updated") {
           const part = props.part || {};
           if (part.sessionID !== opencodeSessionId || part.type !== "text") return;
+          if (part.messageID === userMessageID) return;
+
+          if (!assistantMessageID && part.messageID && part.messageID !== userMessageID) {
+            assistantMessageID = part.messageID;
+          }
+
           if (assistantMessageID && part.messageID !== assistantMessageID) return;
 
           let delta = typeof props.delta === "string" ? props.delta : "";

@@ -218,6 +218,7 @@ OpenCode stores data in three locations that should be persisted:
 | `/home/opencode/.config/opencode` | Global configuration, user preferences, and UI settings |
 | `/home/opencode/.local/share/opencode` | Session storage, cache, and authentication credentials |
 | `/home/opencode/workspace` | Working directory for projects |
+| `/home/opencode/workspace/playbook` | Persistent playbooks for guided, repeatable runs |
 
 ### Volume Mount Examples
 
@@ -365,6 +366,23 @@ gatewayAPI:
               value: /
 ```
 
+### Playbook PVC (Optional)
+
+Mount a dedicated PVC for playbooks and auto-inject all files from `helm/opencode/files/playbook/`:
+
+```yaml
+persistence:
+  playbook:
+    enabled: true
+    mountPath: /home/opencode/workspace/playbook
+    example:
+      enabled: true
+```
+
+After deployment, all files in `helm/opencode/files/playbook/` appear in the pod under:
+
+- `/home/opencode/workspace/playbook/`
+
 ### Global Labels and Annotations
 
 Apply metadata to all resources:
@@ -382,11 +400,12 @@ globalAnnotations:
 
 ### Persistent Volume Claims
 
-The Helm chart creates three PVCs (1Gi each by default):
+The Helm chart creates PVCs (1Gi each by default):
 
 - `<release-name>-config` - Configuration and preferences
 - `<release-name>-data` - Sessions and cache
 - `<release-name>-workspace` - Project workspace
+- `<release-name>-playbook` - Playbook files (only when `persistence.playbook.enabled=true`)
 
 Customize in `values.yaml`:
 

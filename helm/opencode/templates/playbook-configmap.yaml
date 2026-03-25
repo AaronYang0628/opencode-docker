@@ -1,0 +1,18 @@
+{{- if and .Values.persistence.playbook.enabled .Values.persistence.playbook.example.enabled -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "opencode.fullname" . }}-playbook-example
+  labels:
+    {{- include "opencode.labels" . | nindent 4 }}
+    {{- with .Values.globalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+data:
+{{- range $path, $_ := .Files.Glob "files/playbook/*" }}
+  {{ base $path }}: |
+{{ $.Files.Get $path | nindent 4 }}
+{{- else }}
+  .keep: ""
+{{- end }}
+{{- end }}

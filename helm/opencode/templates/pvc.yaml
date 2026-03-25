@@ -82,4 +82,32 @@ spec:
     requests:
       storage: {{ .Values.persistence.workspace.size | default .Values.persistence.size }}
 {{- end }}
+{{- if and .Values.persistence.playbook.enabled (not .Values.persistence.playbook.existingClaim) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "opencode.fullname" . }}-playbook
+  labels:
+    {{- include "opencode.labels" . | nindent 4 }}
+    {{- with .Values.globalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with .Values.persistence.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with or .Values.globalAnnotations .Values.persistence.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  accessModes:
+    - {{ .Values.persistence.accessMode }}
+  {{- if or .Values.persistence.playbook.storageClass .Values.persistence.storageClass }}
+  storageClassName: {{ .Values.persistence.playbook.storageClass | default .Values.persistence.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.playbook.size | default .Values.persistence.size }}
+{{- end }}
 {{- end }}
