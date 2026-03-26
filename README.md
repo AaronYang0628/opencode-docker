@@ -78,6 +78,7 @@ If upstream returns large chunks, bridge can split chunks for smoother UI stream
 
 - `OPENAI_STREAM_CHUNK_SIZE` (default `24`)
 - `OPENAI_STREAM_CHUNK_DELAY_MS` (default `18`)
+- `BRIDGE_STREAM_DEBUG` (default `false`, set `true` to print stream diagnostics)
 
 ### Quick API test
 

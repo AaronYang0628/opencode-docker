@@ -373,6 +373,8 @@ bridge:
     openaiStreamChunkDelayMs: "18"
     # Optional leading echo suppression (may delay first visible tokens)
     enableLeadingEchoFilter: "false"
+    # Optional stream debug logs for troubleshooting
+    bridgeStreamDebug: "false"
 
   # Additional environment variables
   extraEnv: []

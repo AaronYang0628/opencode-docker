@@ -63,6 +63,8 @@ spec:
               value: {{ .Values.bridge.env.openaiStreamChunkDelayMs | quote }}
             - name: ENABLE_LEADING_ECHO_FILTER
               value: {{ .Values.bridge.env.enableLeadingEchoFilter | quote }}
+            - name: BRIDGE_STREAM_DEBUG
+              value: {{ .Values.bridge.env.bridgeStreamDebug | quote }}
             {{- with .Values.bridge.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

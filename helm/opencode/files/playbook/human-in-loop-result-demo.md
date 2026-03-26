@@ -12,6 +12,7 @@
 - objective: 演示“人在回路”：先询问用户、接收简单指令、再继续输出结果
 - scope: 仅输出文本结果，不修改代码
 - out_of_scope: 不执行删除/覆盖/生产变更
+- human_gate_protocol: 遇到 manual_gate 时，先提问，再输出 WAITING_FOR_USER_INPUT，然后结束本轮回复等待用户下一条消息
 - prerequisites:
   - 当前会话可与用户交互
   - 可执行基础命令

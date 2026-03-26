@@ -17,11 +17,21 @@ const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "zzz/claude-sonnet-4-5-202509
 const OPENAI_STREAM_CHUNK_SIZE = Math.max(0, parseInt(process.env.OPENAI_STREAM_CHUNK_SIZE || "24", 10) || 0);
 const OPENAI_STREAM_CHUNK_DELAY_MS = Math.max(0, parseInt(process.env.OPENAI_STREAM_CHUNK_DELAY_MS || "18", 10) || 0);
 const ENABLE_LEADING_ECHO_FILTER = String(process.env.ENABLE_LEADING_ECHO_FILTER || "false").toLowerCase() === "true";
+const BRIDGE_STREAM_DEBUG = String(process.env.BRIDGE_STREAM_DEBUG || "false").toLowerCase() === "true";
 
 // N8N sessionId → OpenCode sessionId 映射（多轮对话）
 const sessionMap = new Map();
 
 // ─── 工具函数 ─────────────────────────────────────────────────
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function streamDebug(...args) {
+  if (!BRIDGE_STREAM_DEBUG) return;
+  console.log("[stream-debug]", ...args);
+}
 
 function fetchJSON(url, options = {}) {
   return new Promise((resolve, reject) => {
@@ -72,11 +82,89 @@ function fetchJSON(url, options = {}) {
 
 // 从 message 响应的 parts 里提取文本
 function extractText(messageResponse) {
-  if (!messageResponse || !messageResponse.parts) return "";
-  return messageResponse.parts
-    .filter((p) => p.type === "text")
-    .map((p) => p.text || "")
+  const parts =
+    (messageResponse && messageResponse.parts) ||
+    (messageResponse && messageResponse.message && messageResponse.message.parts) ||
+    [];
+
+  if (!Array.isArray(parts)) return "";
+
+  return parts
+    .map((p) => {
+      if (!p || typeof p !== "object") return "";
+      if (typeof p.text === "string") return p.text;
+      if (typeof p.content === "string") return p.content;
+      if (typeof p.output_text === "string") return p.output_text;
+      if (typeof p.input_text === "string") return p.input_text;
+      if (Array.isArray(p.content)) {
+        return p.content
+          .map((c) => {
+            if (typeof c === "string") return c;
+            if (!c || typeof c !== "object") return "";
+            return c.text || c.output_text || c.input_text || "";
+          })
+          .join(" ");
+      }
+      return "";
+    })
+    .filter(Boolean)
     .join("");
+}
+
+function extractAssistantTextFromMessages(messagesResponse) {
+  const messages = Array.isArray(messagesResponse)
+    ? messagesResponse
+    : Array.isArray(messagesResponse && messagesResponse.items)
+      ? messagesResponse.items
+      : [];
+
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (!message || typeof message !== "object") continue;
+    if (message.role && message.role !== "assistant") continue;
+
+    const text = extractText(message);
+    if (text) return text;
+  }
+
+  return "";
+}
+
+async function pollAssistantTextFromSession(sessionId, options = {}) {
+  const attempts = Math.max(1, options.attempts || 12);
+  const intervalMs = Math.max(0, options.intervalMs || 800);
+  streamDebug(`poll messages start session=${sessionId} attempts=${attempts} intervalMs=${intervalMs}`);
+
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      const messagesResponse = await fetchJSON(`${OPENCODE_BASE}/session/${sessionId}/messages`, {
+        method: "GET",
+        rejectOnHTTPError: true,
+      });
+      const text = extractAssistantTextFromMessages(messagesResponse);
+      if (text) {
+        streamDebug(`poll messages hit session=${sessionId} attempt=${i + 1} textLen=${text.length}`);
+        return text;
+      }
+    } catch {
+      // ignore transient polling errors
+    }
+
+    if (i < attempts - 1 && intervalMs > 0) {
+      await sleep(intervalMs);
+    }
+  }
+
+  streamDebug(`poll messages empty session=${sessionId}`);
+  return "";
+}
+
+function pickFirst(obj, keys) {
+  if (!obj || typeof obj !== "object") return undefined;
+  for (const key of keys) {
+    if (obj[key] !== undefined && obj[key] !== null) return obj[key];
+  }
+  return undefined;
 }
 
 function writeSSE(res, event, payload) {
@@ -451,6 +539,7 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
   let opencodeSessionId;
   try {
     opencodeSessionId = await resolveOpencodeSession(n8nSessionId, model, true);
+    streamDebug(`start mode=${mode} session=${opencodeSessionId} promptLen=${prompt.length}`);
   } catch (err) {
     res.writeHead(500, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ success: false, error: err.message }));
@@ -485,14 +574,19 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
   let closed = false;
   let eventReq = null;
   let fullText = "";
+  let receivedAnyDelta = false;
+  let completed = false;
   let assistantMessageID = null;
   const userMessageID = createMessageID();
   let promptAccepted = false;
   const echoFilter = ENABLE_LEADING_ECHO_FILTER ? createLeadingEchoFilter(prompt) : createPassThroughFilter();
   let writeQueue = Promise.resolve();
   let closeRequested = false;
+  const startedAt = Date.now();
+  const heartbeat = setInterval(() => {
+    if (!closed) res.write(": ping\n\n");
+  }, 10000);
 
-  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const enqueueWrite = (writer) => {
     writeQueue = writeQueue
       .then(async () => {
@@ -504,6 +598,7 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
   };
 
   const cleanup = () => {
+    clearInterval(heartbeat);
     if (eventReq) {
       eventReq.destroy();
       eventReq = null;
@@ -523,6 +618,8 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
 
   const emitDelta = (text) => {
     if (!text) return;
+    receivedAnyDelta = true;
+    streamDebug(`emit delta session=${opencodeSessionId} len=${text.length} mode=${mode}`);
     if (mode === "bridge") {
       enqueueWrite(() => {
         writeSSE(res, "delta", { text, sessionId: opencodeSessionId });
@@ -548,13 +645,17 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
         });
 
         if (OPENAI_STREAM_CHUNK_DELAY_MS > 0 && index < parts.length - 1) {
-          await delay(OPENAI_STREAM_CHUNK_DELAY_MS);
+          await sleep(OPENAI_STREAM_CHUNK_DELAY_MS);
         }
       });
     });
   };
 
   const emitDone = () => {
+    if (completed) return;
+    completed = true;
+    streamDebug(`emit done session=${opencodeSessionId} fullTextLen=${fullText.length} mode=${mode}`);
+
     const tail = echoFilter.flush();
     if (tail) {
       fullText += tail;
@@ -591,6 +692,7 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
   };
 
   const emitError = (message) => {
+    streamDebug(`emit error session=${opencodeSessionId} message=${message}`);
     if (mode === "bridge") {
       enqueueWrite(() => {
         writeSSE(res, "error", { success: false, sessionId: opencodeSessionId, error: message });
@@ -609,7 +711,7 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
     });
   };
 
-  req.on("close", () => {
+  res.on("close", () => {
     closed = true;
     cleanup();
   });
@@ -656,15 +758,23 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
 
         if (type === "message.updated") {
           const info = props.info || {};
-          if (info.sessionID !== opencodeSessionId) return;
+          const infoSessionID = pickFirst(info, ["sessionID", "sessionId", "session_id"]);
+          if (infoSessionID !== opencodeSessionId) return;
 
-          if (info.role === "user" && info.id === userMessageID) {
+          const infoID = pickFirst(info, ["id", "messageID", "messageId", "message_id"]);
+          const parentID = pickFirst(info, ["parentID", "parentId", "parent_id"]);
+
+          if (info.role === "user" && infoID === userMessageID) {
             promptAccepted = true;
             return;
           }
 
-          if (info.role === "assistant" && info.parentID === userMessageID) {
-            assistantMessageID = info.id;
+          if (info.role === "assistant" && !assistantMessageID && promptAccepted) {
+            assistantMessageID = infoID || assistantMessageID;
+          }
+
+          if (info.role === "assistant" && parentID === userMessageID) {
+            assistantMessageID = infoID;
             if (info.time && info.time.completed) {
               emitDone();
               closeStream();
@@ -672,7 +782,7 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
             return;
           }
 
-          if (assistantMessageID && info.id === assistantMessageID && info.time && info.time.completed) {
+          if (assistantMessageID && infoID === assistantMessageID && info.time && info.time.completed) {
             emitDone();
             closeStream();
           }
@@ -681,14 +791,17 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
 
         if (type === "message.part.updated") {
           const part = props.part || {};
-          if (part.sessionID !== opencodeSessionId || part.type !== "text") return;
-          if (part.messageID === userMessageID) return;
+          const partSessionID = pickFirst(part, ["sessionID", "sessionId", "session_id"]);
+          const partMessageID = pickFirst(part, ["messageID", "messageId", "message_id"]);
 
-          if (!assistantMessageID && part.messageID && part.messageID !== userMessageID) {
-            assistantMessageID = part.messageID;
+          if (partSessionID !== opencodeSessionId || part.type !== "text") return;
+          if (partMessageID === userMessageID) return;
+
+          if (!assistantMessageID && partMessageID && partMessageID !== userMessageID) {
+            assistantMessageID = partMessageID;
           }
 
-          if (assistantMessageID && part.messageID !== assistantMessageID) return;
+          if (assistantMessageID && partMessageID && partMessageID !== assistantMessageID) return;
 
           let delta = typeof props.delta === "string" ? props.delta : "";
           if (!delta && typeof part.text === "string" && part.text.length > fullText.length) {
@@ -699,16 +812,19 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
             }
           }
 
-          if (delta) {
-            const filtered = echoFilter.apply(delta);
-            if (!filtered) return;
-            fullText += filtered;
-            emitDelta(filtered);
-          }
-          return;
+            if (delta) {
+              const filtered = echoFilter.apply(delta);
+              if (!filtered) return;
+              fullText += filtered;
+              emitDelta(filtered);
+            } else if (BRIDGE_STREAM_DEBUG && typeof part.text === "string") {
+              streamDebug(`part without delta session=${opencodeSessionId} messageID=${partMessageID || "unknown"} partTextLen=${part.text.length}`);
+            }
+            return;
         }
 
-        if (type === "session.status" && props.sessionID === opencodeSessionId) {
+        const sessionID = pickFirst(props, ["sessionID", "sessionId", "session_id"]);
+        if (type === "session.status" && sessionID === opencodeSessionId) {
           if (props.status && props.status.type === "idle" && promptAccepted) {
             emitDone();
             closeStream();
@@ -716,14 +832,14 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
           return;
         }
 
-        if (type === "session.idle" && props.sessionID === opencodeSessionId && promptAccepted) {
+        if (type === "session.idle" && sessionID === opencodeSessionId && promptAccepted) {
           emitDone();
           closeStream();
           return;
         }
 
         if (type === "session.error") {
-          if (!props.sessionID || props.sessionID === opencodeSessionId) {
+          if (!sessionID || sessionID === opencodeSessionId) {
             const err = props.error;
             const message =
               (err && err.data && err.data.message) ||
@@ -764,11 +880,58 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
     ]);
 
     console.log(`[流式发送消息] ${prompt.slice(0, 80)}`);
-    await fetchJSON(`${OPENCODE_BASE}/session/${opencodeSessionId}/prompt_async`, {
+    const messagePromise = fetchJSON(`${OPENCODE_BASE}/session/${opencodeSessionId}/message`, {
       method: "POST",
       body: { messageID: userMessageID, parts: [{ type: "text", text: prompt }] },
       rejectOnHTTPError: true,
     });
+
+    messagePromise
+      .then(async (messageResponse) => {
+        if (closed || completed) return;
+
+        // 若上游事件流没有任何 delta，则回退到完整响应，避免长时间挂起
+        if (!receivedAnyDelta) {
+          streamDebug(`no delta from events, try fallback session=${opencodeSessionId}`);
+          let text = extractText(messageResponse);
+
+          if (!text) {
+            text = await pollAssistantTextFromSession(opencodeSessionId);
+          }
+
+          if (text) {
+            const filtered = echoFilter.apply(text);
+            if (filtered) {
+              fullText += filtered;
+              emitDelta(filtered);
+            }
+          }
+        }
+
+        if (!fullText && !receivedAnyDelta) {
+          emitError("upstream returned empty assistant content");
+          closeStream();
+          return;
+        }
+
+        emitDone();
+        closeStream();
+      })
+      .catch((err) => {
+        if (closed || completed) return;
+        emitError(err.message || "message request failed");
+        closeStream();
+      });
+
+    promptAccepted = true;
+
+    // 最长等待 5 分钟；若上游完全无有效消息则返回错误，避免无限挂起
+    setTimeout(() => {
+      if (closed) return;
+      if (Date.now() - startedAt < 300000) return;
+      emitError("upstream did not produce completion in time");
+      closeStream();
+    }, 300000);
   } catch (err) {
     emitError(err.message);
     closeStream();
