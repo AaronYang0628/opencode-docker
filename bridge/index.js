@@ -7,6 +7,12 @@
  *   OPENCODE_BASE   - OpenCode 服务地址（默认集群内部地址）
  *   DEFAULT_MODEL   - 默认模型
  *   BRIDGE_PORT     - 监听端口（默认 3100）
+ *
+ * 修复记录:
+ *   - 移除 `: connected\n\n` SSE comment，避免 openai SDK 误判流已开始
+ *   - 移除提前发送的空 role delta chunk，改为第一个真实 content delta 时再发
+ *   - 响应头增加 Transfer-Encoding: chunked，防止 nginx 缓冲
+ *   - openaiStreamChunkSize 默认改为 4，避免单次大 chunk 导致 n8n 流式失效
  */
 
 const http = require("http");
@@ -14,8 +20,9 @@ const http = require("http");
 const OPENCODE_BASE = process.env.OPENCODE_BASE || "http://opencode.opencode.svc.cluster.local:4000";
 const BRIDGE_PORT   = parseInt(process.env.BRIDGE_PORT || "3100");
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "zzz/claude-sonnet-4-5-20250929-thinking";
-const OPENAI_STREAM_CHUNK_SIZE = Math.max(0, parseInt(process.env.OPENAI_STREAM_CHUNK_SIZE || "24", 10) || 0);
-const OPENAI_STREAM_CHUNK_DELAY_MS = Math.max(0, parseInt(process.env.OPENAI_STREAM_CHUNK_DELAY_MS || "18", 10) || 0);
+// FIX: 默认改为 4，避免整个响应作为单个 chunk 发出
+const OPENAI_STREAM_CHUNK_SIZE = Math.max(0, parseInt(process.env.OPENAI_STREAM_CHUNK_SIZE || "4", 10) || 0);
+const OPENAI_STREAM_CHUNK_DELAY_MS = Math.max(0, parseInt(process.env.OPENAI_STREAM_CHUNK_DELAY_MS || "10", 10) || 0);
 const ENABLE_LEADING_ECHO_FILTER = String(process.env.ENABLE_LEADING_ECHO_FILTER || "false").toLowerCase() === "true";
 const BRIDGE_STREAM_DEBUG = String(process.env.BRIDGE_STREAM_DEBUG || "false").toLowerCase() === "true";
 
@@ -71,7 +78,7 @@ function fetchJSON(url, options = {}) {
       });
     });
     req.on("error", reject);
-    req.setTimeout(120000, () => {
+    req.setTimeout(options.timeoutMs || 290000, () => {
       req.destroy();
       reject(new Error("Request timeout"));
     });
@@ -329,6 +336,41 @@ function buildPromptFromMessages(messages) {
   return `${systemBlocks.join("\n\n")}\n\n${mainText}`;
 }
 
+// 从 messages 数组里提取第一条 user 消息内容，用于生成稳定的 session fingerprint
+// n8n 每次请求都携带完整对话历史，同一对话的第一条消息是固定的，可作为 session key
+function deriveSessionKeyFromMessages(messages) {
+  if (!Array.isArray(messages)) return null;
+
+  // 优先策略：从任意消息内容里提取明确注入的 sessionId
+  // 支持格式（来自 n8n system prompt 注入）：
+  //   "当前sessionId是 <id>"
+  //   "sessionId: <id>"
+  //   "session_id: <id>"
+  //   "sessionId=<id>"
+  const SESSION_ID_PATTERN = /(?:当前sessionId是|sessionId[\s:=]+|session_id[\s:=]+)([a-zA-Z0-9_\-]{8,})/i;
+
+  for (const msg of messages) {
+    if (!msg || typeof msg !== "object") continue;
+    const text = messageContentToText(msg.content);
+    if (!text) continue;
+    const m = text.match(SESSION_ID_PATTERN);
+    if (m && m[1]) {
+      return m[1];
+    }
+  }
+
+  // 兜底策略：用 system message 前 120 字符做 fingerprint（同一对话 system prompt 固定不变）
+  for (const msg of messages) {
+    if (!msg || typeof msg !== "object") continue;
+    if (msg.role !== "system") continue;
+    const text = messageContentToText(msg.content);
+    if (!text || text.trim().length < 8) continue;
+    return "sys:" + text.trim().slice(0, 120);
+  }
+
+  return null;
+}
+
 function extractOpenAIInput(payload = {}) {
   const root = payload && typeof payload === "object" ? payload : {};
   const metadata = root.metadata && typeof root.metadata === "object" ? root.metadata : {};
@@ -336,7 +378,8 @@ function extractOpenAIInput(payload = {}) {
   const promptFromMessages = buildPromptFromMessages(root.messages);
   const promptRaw = root.prompt ?? root.input ?? root.query ?? promptFromMessages;
 
-  const sessionIdRaw =
+  // 优先从请求字段里找明确的 sessionId
+  const explicitSessionId =
     root.sessionId ??
     root.session_id ??
     root.conversationId ??
@@ -345,12 +388,26 @@ function extractOpenAIInput(payload = {}) {
     root.chat_id ??
     metadata.sessionId ??
     metadata.session_id ??
-    root.user;
+    root.user ??
+    null;
+
+  // n8n lmChatOpenAi 不传 sessionId，fallback：用 messages 历史的首条消息内容做 fingerprint
+  // 同一对话的每次请求都携带相同的 messages[0]，因此可以稳定复用同一个 OpenCode session
+  const sessionIdRaw = explicitSessionId ?? deriveSessionKeyFromMessages(root.messages);
+
+  if (!explicitSessionId && sessionIdRaw) {
+    console.log(`[session-fingerprint] derived from messages: ${sessionIdRaw.slice(0, 60)}...`);
+  } else if (!sessionIdRaw) {
+    console.warn("[session-debug] sessionId not found and messages empty, will create new session each time");
+    console.warn("[session-debug] request keys:", Object.keys(root).join(", "));
+  }
 
   return {
     prompt: toPromptText(promptRaw),
     n8nSessionId: normalizeInputString(sessionIdRaw),
     model: normalizeInputString(root.model),
+    // 透传完整 messages 供后续使用
+    messages: Array.isArray(root.messages) ? root.messages : [],
   };
 }
 
@@ -508,7 +565,15 @@ function extractN8nInput(payload = {}) {
 }
 
 async function resolveOpencodeSession(n8nSessionId, model, rejectOnHTTPError = false) {
-  let opencodeSessionId = sessionMap.get(n8nSessionId);
+  // 只有合法的非空 sessionId 才参与缓存，避免 undefined/"undefined" 导致每次新建
+  const validId = n8nSessionId &&
+    n8nSessionId !== "undefined" &&
+    n8nSessionId !== "null" &&
+    String(n8nSessionId).trim() !== ""
+      ? String(n8nSessionId).trim()
+      : null;
+
+  let opencodeSessionId = validId ? sessionMap.get(validId) : undefined;
   if (!opencodeSessionId) {
     const session = await fetchJSON(`${OPENCODE_BASE}/session`, {
       method: "POST",
@@ -516,10 +581,15 @@ async function resolveOpencodeSession(n8nSessionId, model, rejectOnHTTPError = f
       rejectOnHTTPError,
     });
     opencodeSessionId = session.id;
-    if (n8nSessionId) sessionMap.set(n8nSessionId, opencodeSessionId);
-    console.log(`[新建Session] n8n:${n8nSessionId} → opencode:${opencodeSessionId}`);
+    if (validId) {
+      sessionMap.set(validId, opencodeSessionId);
+      console.log(`[新建Session] n8n:${validId} -> opencode:${opencodeSessionId}`);
+    } else {
+      // sessionId 缺失，无法复用，每次都新建（需要配置 n8n 传入 sessionId）
+      console.log(`[新建Session] n8n:(no valid sessionId) -> opencode:${opencodeSessionId}`);
+    }
   } else {
-    console.log(`[复用Session] opencode:${opencodeSessionId}`);
+    console.log(`[复用Session] n8n:${validId} -> opencode:${opencodeSessionId}`);
   }
   return opencodeSessionId;
 }
@@ -546,30 +616,26 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
     return;
   }
 
-  res.writeHead(200, {
+  // FIX: 增加 Transfer-Encoding: chunked，防止 nginx 缓冲整个响应
+  // FIX: 不再提前发送任何 chunk，等第一个真实 delta 到来时再写响应头 + 内容
+  const responseHeaders = {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
-    Connection: "keep-alive",
+    "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
-  });
-  res.write(`: connected\n\n`);
-  if (mode === "bridge") {
-    writeSSE(res, "meta", { success: true, sessionId: opencodeSessionId });
-  } else {
-    writeOpenAIStreamChunk(res, {
-      id: completionId,
-      object: "chat.completion.chunk",
-      created,
-      model: responseModel,
-      choices: [
-        {
-          index: 0,
-          delta: { role: "assistant" },
-          finish_reason: null,
-        },
-      ],
-    });
-  }
+    "Transfer-Encoding": "chunked",
+  };
+
+  let headersSent = false;
+  // FIX: openai mode 下，第一个 content delta 到来时才发响应头 + role chunk
+  // 这样 openai SDK 不会因为长时间没有 content 而认为流已结束
+  let sentRoleChunk = false;
+
+  const ensureHeadersSent = () => {
+    if (headersSent) return;
+    headersSent = true;
+    res.writeHead(200, responseHeaders);
+  };
 
   let closed = false;
   let eventReq = null;
@@ -583,9 +649,26 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
   let writeQueue = Promise.resolve();
   let closeRequested = false;
   const startedAt = Date.now();
-  const heartbeat = setInterval(() => {
-    if (!closed) res.write(": ping\n\n");
-  }, 10000);
+  // 最后一次收到 delta 的时间，用于静默超时检测（playbook manual_gate 后 opencode 停止推送）
+  let lastDeltaAt = 0;
+
+  // FIX: heartbeat 只在 bridge 模式发，openai 模式不发 SSE comment
+  // openai SDK 遇到非 data: 开头的行会跳过，但频繁的 comment 可能干扰某些实现
+  const heartbeat = mode === "bridge"
+    ? setInterval(() => { if (!closed && headersSent) res.write(": ping\n\n"); }, 10000)
+    : null;
+
+  // 静默超时：有 delta 输出后，若超过 SILENCE_TIMEOUT_MS 没有新 delta，认为 opencode 已暂停
+  // 主要用于捕获 playbook manual_gate 后 opencode 停止推送但不发 idle 事件的情况
+  const SILENCE_TIMEOUT_MS = parseInt(process.env.BRIDGE_SILENCE_TIMEOUT_MS || "15000", 10);
+  const silenceChecker = setInterval(() => {
+    if (closed || completed || !receivedAnyDelta) return;
+    if (lastDeltaAt > 0 && Date.now() - lastDeltaAt > SILENCE_TIMEOUT_MS) {
+      console.log(`[silence-timeout] no delta for ${SILENCE_TIMEOUT_MS}ms, closing stream session=${opencodeSessionId}`);
+      emitDone();
+      closeStream();
+    }
+  }, 3000);
 
   const enqueueWrite = (writer) => {
     writeQueue = writeQueue
@@ -598,7 +681,8 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
   };
 
   const cleanup = () => {
-    clearInterval(heartbeat);
+    if (heartbeat) clearInterval(heartbeat);
+    clearInterval(silenceChecker);
     if (eventReq) {
       eventReq.destroy();
       eventReq = null;
@@ -610,6 +694,8 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
     closeRequested = true;
     writeQueue.finally(() => {
       if (closed) return;
+      // 如果从未发过任何内容（比如 OpenCode 没有响应），确保头已发出再结束
+      ensureHeadersSent();
       res.end();
       closed = true;
       cleanup();
@@ -620,28 +706,40 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
     if (!text) return;
     receivedAnyDelta = true;
     streamDebug(`emit delta session=${opencodeSessionId} len=${text.length} mode=${mode}`);
+    lastDeltaAt = Date.now();
+
     if (mode === "bridge") {
+      ensureHeadersSent();
       enqueueWrite(() => {
         writeSSE(res, "delta", { text, sessionId: opencodeSessionId });
       });
       return;
     }
 
+    // openai mode
     const parts = splitStreamText(text, OPENAI_STREAM_CHUNK_SIZE);
     parts.forEach((part, index) => {
       enqueueWrite(async () => {
+        // FIX: 第一个真实 content delta 到来时才发响应头和 role chunk
+        // 避免提前发空 role chunk 后长时间无内容，导致 openai SDK 误判流结束
+        if (!sentRoleChunk) {
+          sentRoleChunk = true;
+          ensureHeadersSent();
+          writeOpenAIStreamChunk(res, {
+            id: completionId,
+            object: "chat.completion.chunk",
+            created,
+            model: responseModel,
+            choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+          });
+        }
+
         writeOpenAIStreamChunk(res, {
           id: completionId,
           object: "chat.completion.chunk",
           created,
           model: responseModel,
-          choices: [
-            {
-              index: 0,
-              delta: { content: part },
-              finish_reason: null,
-            },
-          ],
+          choices: [{ index: 0, delta: { content: part }, finish_reason: null }],
         });
 
         if (OPENAI_STREAM_CHUNK_DELAY_MS > 0 && index < parts.length - 1) {
@@ -663,6 +761,7 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
     }
 
     if (mode === "bridge") {
+      ensureHeadersSent();
       enqueueWrite(() => {
         writeSSE(res, "done", {
           success: true,
@@ -673,19 +772,26 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
       return;
     }
 
+    // openai mode
     enqueueWrite(() => {
+      // FIX: 如果整个过程都没有 delta（极端情况），这里补发 role chunk 确保响应合法
+      if (!sentRoleChunk) {
+        sentRoleChunk = true;
+        ensureHeadersSent();
+        writeOpenAIStreamChunk(res, {
+          id: completionId,
+          object: "chat.completion.chunk",
+          created,
+          model: responseModel,
+          choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+        });
+      }
       writeOpenAIStreamChunk(res, {
         id: completionId,
         object: "chat.completion.chunk",
         created,
         model: responseModel,
-        choices: [
-          {
-            index: 0,
-            delta: {},
-            finish_reason: "stop",
-          },
-        ],
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
       });
       writeOpenAIStreamDone(res);
     });
@@ -693,6 +799,8 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
 
   const emitError = (message) => {
     streamDebug(`emit error session=${opencodeSessionId} message=${message}`);
+    ensureHeadersSent();
+
     if (mode === "bridge") {
       enqueueWrite(() => {
         writeSSE(res, "error", { success: false, sessionId: opencodeSessionId, error: message });
@@ -702,10 +810,7 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
 
     enqueueWrite(() => {
       writeOpenAIStreamChunk(res, {
-        error: {
-          message,
-          type: "server_error",
-        },
+        error: { message, type: "server_error" },
       });
       writeOpenAIStreamDone(res);
     });
@@ -737,15 +842,15 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
       if (eventRes.statusCode >= 400) {
         let upstreamError = "";
         eventRes.on("data", (chunk) => (upstreamError += chunk.toString("utf8")));
-          eventRes.on("end", () => {
-            rejectStreamReady(new Error(`event stream HTTP ${eventRes.statusCode}: ${upstreamError || "upstream error"}`));
-            if (!closed) {
-              emitError(`event stream HTTP ${eventRes.statusCode}: ${upstreamError || "upstream error"}`);
-              closeStream();
-            }
-          });
-          return;
-        }
+        eventRes.on("end", () => {
+          rejectStreamReady(new Error(`event stream HTTP ${eventRes.statusCode}: ${upstreamError || "upstream error"}`));
+          if (!closed) {
+            emitError(`event stream HTTP ${eventRes.statusCode}: ${upstreamError || "upstream error"}`);
+            closeStream();
+          }
+        });
+        return;
+      }
 
       resolveStreamReady();
 
@@ -812,20 +917,31 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
             }
           }
 
-            if (delta) {
-              const filtered = echoFilter.apply(delta);
-              if (!filtered) return;
-              fullText += filtered;
-              emitDelta(filtered);
-            } else if (BRIDGE_STREAM_DEBUG && typeof part.text === "string") {
-              streamDebug(`part without delta session=${opencodeSessionId} messageID=${partMessageID || "unknown"} partTextLen=${part.text.length}`);
+          if (delta) {
+            const filtered = echoFilter.apply(delta);
+            if (!filtered) return;
+            fullText += filtered;
+            emitDelta(filtered);
+
+            // 检测 playbook manual_gate：opencode 输出 WAITING_FOR_USER_INPUT 后暂停等待下一轮输入
+            // bridge 收到该标记后立即结束当前流，把提示语返回给用户，避免无限挂起
+            if (filtered.includes("WAITING_FOR_USER_INPUT") || fullText.includes("WAITING_FOR_USER_INPUT")) {
+              console.log(`[manual-gate] detected WAITING_FOR_USER_INPUT, closing stream session=${opencodeSessionId}`);
+              emitDone();
+              closeStream();
+              return;
             }
-            return;
+          } else if (BRIDGE_STREAM_DEBUG && typeof part.text === "string") {
+            streamDebug(`part without delta session=${opencodeSessionId} messageID=${partMessageID || "unknown"} partTextLen=${part.text.length}`);
+          }
+          return;
         }
 
         const sessionID = pickFirst(props, ["sessionID", "sessionId", "session_id"]);
         if (type === "session.status" && sessionID === opencodeSessionId) {
-          if (props.status && props.status.type === "idle" && promptAccepted) {
+          // opencode 进入 waiting 状态说明是 manual_gate，立即结束当前流
+          const statusType = props.status && props.status.type;
+          if ((statusType === "idle" || statusType === "waiting") && promptAccepted) {
             emitDone();
             closeStream();
           }
@@ -833,6 +949,14 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
         }
 
         if (type === "session.idle" && sessionID === opencodeSessionId && promptAccepted) {
+          emitDone();
+          closeStream();
+          return;
+        }
+
+        // opencode 专用：session 进入等待用户输入状态（playbook manual_gate）
+        if (type === "session.waiting" && sessionID === opencodeSessionId && promptAccepted) {
+          console.log(`[manual-gate] session.waiting event, closing stream session=${opencodeSessionId}`);
           emitDone();
           closeStream();
           return;
@@ -880,10 +1004,12 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
     ]);
 
     console.log(`[流式发送消息] ${prompt.slice(0, 80)}`);
+    // message POST 只是提交消息，不等推理完成，用短超时即可（推理结果通过 /event SSE 异步推送）
     const messagePromise = fetchJSON(`${OPENCODE_BASE}/session/${opencodeSessionId}/message`, {
       method: "POST",
       body: { messageID: userMessageID, parts: [{ type: "text", text: prompt }] },
       rejectOnHTTPError: true,
+      timeoutMs: 30000,
     });
 
     messagePromise
@@ -896,7 +1022,8 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
           let text = extractText(messageResponse);
 
           if (!text) {
-            text = await pollAssistantTextFromSession(opencodeSessionId);
+            // 慢模型（如 minimax）推理时间可能超过 2 分钟，加大轮询次数和间隔
+            text = await pollAssistantTextFromSession(opencodeSessionId, { attempts: 180, intervalMs: 1500 });
           }
 
           if (text) {
@@ -1071,7 +1198,6 @@ const server = http.createServer(async (req, res) => {
         const { prompt, sessionId: n8nSessionId, model } = JSON.parse(body);
         if (!prompt) throw new Error("prompt is required");
 
-        // 复用或新建 OpenCode Session
         let opencodeSessionId = sessionMap.get(n8nSessionId);
         if (!opencodeSessionId) {
           const session = await fetchJSON(`${OPENCODE_BASE}/session`, {
@@ -1200,4 +1326,6 @@ server.listen(BRIDGE_PORT, "0.0.0.0", () => {
   console.log(`✅ OpenCode Bridge v4 (K8s) @ http://0.0.0.0:${BRIDGE_PORT}`);
   console.log(`   OpenCode Backend: ${OPENCODE_BASE}`);
   console.log(`   Default Model:    ${DEFAULT_MODEL}`);
+  console.log(`   Stream ChunkSize: ${OPENAI_STREAM_CHUNK_SIZE}`);
+  console.log(`   Stream ChunkDelay: ${OPENAI_STREAM_CHUNK_DELAY_MS}ms`);
 });
