@@ -616,8 +616,6 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
     return;
   }
 
-  // FIX: 增加 Transfer-Encoding: chunked，防止 nginx 缓冲整个响应
-  // FIX: 不再提前发送任何 chunk，等第一个真实 delta 到来时再写响应头 + 内容
   const responseHeaders = {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -626,15 +624,20 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
     "Transfer-Encoding": "chunked",
   };
 
-  let headersSent = false;
-  // FIX: openai mode 下，第一个 content delta 到来时才发响应头 + role chunk
-  // 这样 openai SDK 不会因为长时间没有 content 而认为流已结束
+  // 立即发响应头，让 n8n AI Agent 知道连接已建立，避免 streaming 握手超时
+  // n8n 在 streaming 模式下会等待 HTTP 200 + 首字节，若迟迟没有会报 "No response received"
+  res.writeHead(200, responseHeaders);
+  let headersSent = true;
   let sentRoleChunk = false;
 
+  // 立即写一个 SSE comment 作为 keep-alive 心跳，让 n8n 确认连接活跃
+  // openai SDK 会忽略以 ": " 开头的 SSE comment，不影响解析
+  res.write(": keep-alive
+
+");
+
   const ensureHeadersSent = () => {
-    if (headersSent) return;
-    headersSent = true;
-    res.writeHead(200, responseHeaders);
+    // 头已在函数入口发出，此函数保留作为兼容调用点
   };
 
   let closed = false;
@@ -652,11 +655,14 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
   // 最后一次收到 delta 的时间，用于静默超时检测（playbook manual_gate 后 opencode 停止推送）
   let lastDeltaAt = 0;
 
-  // FIX: heartbeat 只在 bridge 模式发，openai 模式不发 SSE comment
-  // openai SDK 遇到非 data: 开头的行会跳过，但频繁的 comment 可能干扰某些实现
-  const heartbeat = mode === "bridge"
-    ? setInterval(() => { if (!closed && headersSent) res.write(": ping\n\n"); }, 10000)
-    : null;
+  // 所有模式都发 SSE comment 心跳，间隔 5s
+  // openai SDK 规范要求忽略 SSE comment（以 ":" 开头的行），n8n 也遵循此规范
+  // 心跳作用：① 防止 nginx/load-balancer 因空闲关闭连接  ② 让 n8n 持续收到字节不触发读超时
+  const heartbeat = setInterval(() => {
+    if (!closed) res.write(": ping
+
+");
+  }, 5000);
 
   // 静默超时：有 delta 输出后，若超过 SILENCE_TIMEOUT_MS 没有新 delta，认为 opencode 已暂停
   // 主要用于捕获 playbook manual_gate 后 opencode 停止推送但不发 idle 事件的情况
@@ -669,6 +675,19 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
       closeStream();
     }
   }, 3000);
+
+  // openai mode: 立即发 role chunk，让 openai SDK 确认流已开始
+  // 不等第一个 content delta，避免 n8n 因长时间无内容报 'No response received'
+  if (mode === "openai") {
+    sentRoleChunk = true;
+    writeOpenAIStreamChunk(res, {
+      id: completionId,
+      object: "chat.completion.chunk",
+      created,
+      model: responseModel,
+      choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+    });
+  }
 
   const enqueueWrite = (writer) => {
     writeQueue = writeQueue
