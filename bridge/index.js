@@ -25,9 +25,233 @@ const OPENAI_STREAM_CHUNK_SIZE = Math.max(0, parseInt(process.env.OPENAI_STREAM_
 const OPENAI_STREAM_CHUNK_DELAY_MS = Math.max(0, parseInt(process.env.OPENAI_STREAM_CHUNK_DELAY_MS || "10", 10) || 0);
 const ENABLE_LEADING_ECHO_FILTER = String(process.env.ENABLE_LEADING_ECHO_FILTER || "false").toLowerCase() === "true";
 const BRIDGE_STREAM_DEBUG = String(process.env.BRIDGE_STREAM_DEBUG || "false").toLowerCase() === "true";
+const MESSAGE_POST_TIMEOUT_MS = Math.max(10000, parseInt(process.env.BRIDGE_MESSAGE_TIMEOUT_MS || "300000", 10) || 300000);
+const SILENCE_TIMEOUT_MS = Math.max(0, parseInt(process.env.BRIDGE_SILENCE_TIMEOUT_MS || "0", 10) || 0);
 
 // N8N sessionId → OpenCode sessionId 映射（多轮对话）
 const sessionMap = new Map();
+
+// ─── 统计数据 ────────────────────────────────────────────────
+// Bridge 启动时间
+const BRIDGE_START_TIME = Date.now();
+
+// ─── 全局共享 SSE 事件流 ──────────────────────────────────────
+// OpenCode /event 是全局流，包含所有 session 的事件。
+// 用单一连接 + 订阅者分发，避免多个并发请求各自连接导致的：
+//   1. 事件被某个连接独占消费，其他连接漏收
+//   2. OpenCode 并发 SSE 连接限制
+//   3. 多请求互相干扰（错乱根本原因）
+const globalEventBus = {
+  // 当前 SSE 连接
+  req: null,
+  connected: false,
+  reconnectTimer: null,
+  // 订阅者 Map: subscriptionId -> { sessionId, callback }
+  subscribers: new Map(),
+  _subIdCounter: 0,
+
+  subscribe(opencodeSessionId, callback) {
+    const id = ++this._subIdCounter;
+    this.subscribers.set(id, { opencodeSessionId, callback });
+    this._ensureConnected();
+    return id;
+  },
+
+  unsubscribe(subscriptionId) {
+    this.subscribers.delete(subscriptionId);
+  },
+
+  _dispatch(event) {
+    // Pre-filter by sessionId before dispatching to each subscriber.
+    // This is the primary guard against cross-session event contamination.
+    const data = event && event.data;
+    const props = (data && data.properties) || {};
+    let eventSessionId = null;
+    if (props.info)  eventSessionId = props.info.sessionID  || props.info.sessionId  || props.info.session_id  || null;
+    if (!eventSessionId && props.part) eventSessionId = props.part.sessionID || props.part.sessionId || props.part.session_id || null;
+    if (!eventSessionId) eventSessionId = props.sessionID || props.sessionId || props.session_id || null;
+
+    for (const [, sub] of this.subscribers) {
+      if (eventSessionId && sub.opencodeSessionId && eventSessionId !== sub.opencodeSessionId) continue;
+      try { sub.callback(event); } catch {}
+    }
+  },
+
+  _ensureConnected() {
+    if (this.connected || this.req) return;
+    this._connect();
+  },
+
+  _connect() {
+    if (this.req) return;
+    const u = new URL(`${OPENCODE_BASE}/event`);
+    const opts = {
+      hostname: u.hostname,
+      port: u.port || 80,
+      path: u.pathname + u.search,
+      method: "GET",
+      headers: { Accept: "text/event-stream" },
+    };
+    const req = http.request(opts, (res) => {
+      if (res.statusCode >= 400) {
+        console.error(`[event-bus] connect failed HTTP ${res.statusCode}`);
+        res.resume();
+        this._scheduleReconnect();
+        return;
+      }
+      this.connected = true;
+      this.req = req;
+      console.log("[event-bus] connected to OpenCode /event");
+
+      const parse = createSSEParser((ev) => this._dispatch(ev));
+      res.on("data", parse);
+      res.on("end", () => {
+        console.warn("[event-bus] stream ended, reconnecting...");
+        this.connected = false;
+        this.req = null;
+        this._scheduleReconnect();
+      });
+    });
+    req.on("error", (err) => {
+      console.error(`[event-bus] error: ${err.message}`);
+      this.connected = false;
+      this.req = null;
+      this._scheduleReconnect();
+    });
+    req.setTimeout(0); // no timeout on the shared stream
+    req.end();
+    this.req = req;
+  },
+
+  _scheduleReconnect() {
+    if (this.reconnectTimer) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.req = null;
+      if (this.subscribers.size > 0) this._connect();
+    }, 2000);
+  },
+};
+
+// 请求计数器
+const stats = {
+  totalRequests: 0,
+  successRequests: 0,
+  errorRequests: 0,
+  timeoutRequests: 0,
+};
+
+// 每个 OpenCode session 的详细指标
+// key: opencodeSessionId, value: SessionMetrics
+const sessionMetrics = new Map();
+
+function getOrCreateMetrics(opencodeSessionId, n8nSessionId) {
+  if (!sessionMetrics.has(opencodeSessionId)) {
+    sessionMetrics.set(opencodeSessionId, {
+      opencodeSessionId,
+      n8nSessionId: n8nSessionId || null,
+      createdAt: Date.now(),
+      lastActiveAt: Date.now(),
+      turns: 0,           // 完成的对话轮次
+      errors: 0,
+      timeouts: 0,
+      ttftSamples: [],    // 首 token 延迟样本 (ms)
+      durationSamples: [], // 完整响应时长样本 (ms)
+      // token 用量（从 OpenCode API 拉取后填充）
+      inputTokens: 0,
+      outputTokens: 0,
+      lastFetchedAt: 0,
+    });
+  }
+  return sessionMetrics.get(opencodeSessionId);
+}
+
+function recordTurnStart(opencodeSessionId, n8nSessionId) {
+  const m = getOrCreateMetrics(opencodeSessionId, n8nSessionId);
+  m.lastActiveAt = Date.now();
+  stats.totalRequests++;
+  return Date.now();
+}
+
+function recordFirstDelta(opencodeSessionId, startedAt) {
+  const m = sessionMetrics.get(opencodeSessionId);
+  if (!m) return;
+  const ttft = Date.now() - startedAt;
+  m.ttftSamples.push(ttft);
+  if (m.ttftSamples.length > 50) m.ttftSamples.shift();
+}
+
+function recordTurnDone(opencodeSessionId, startedAt, success) {
+  const m = sessionMetrics.get(opencodeSessionId);
+  if (!m) return;
+  m.lastActiveAt = Date.now();
+  if (success) {
+    m.turns++;
+    stats.successRequests++;
+    const duration = Date.now() - startedAt;
+    m.durationSamples.push(duration);
+    if (m.durationSamples.length > 50) m.durationSamples.shift();
+  } else {
+    m.errors++;
+    stats.errorRequests++;
+  }
+}
+
+function recordTimeout(opencodeSessionId) {
+  const m = sessionMetrics.get(opencodeSessionId);
+  if (m) { m.timeouts++; m.lastActiveAt = Date.now(); }
+  stats.timeoutRequests++;
+  stats.errorRequests++;
+}
+
+function avg(arr) {
+  if (!arr || arr.length === 0) return 0;
+  return Math.round(arr.reduce((a, b) => a + b, 0) / arr.length);
+}
+
+// 从 OpenCode API 拉取单个 session 的 token 用量
+async function fetchSessionTokens(opencodeSessionId) {
+  try {
+    const messages = await fetchJSON(`${OPENCODE_BASE}/session/${opencodeSessionId}/messages`, {
+      method: "GET",
+      timeoutMs: 10000,
+    });
+    if (!Array.isArray(messages)) return null;
+
+    let inputTokens = 0;
+    let outputTokens = 0;
+    for (const msg of messages) {
+      if (!msg || typeof msg !== "object") continue;
+      const t = msg.tokens || msg.usage || {};
+      inputTokens  += t.input  || t.prompt_tokens     || t.inputTokens  || 0;
+      outputTokens += t.output || t.completion_tokens || t.outputTokens || 0;
+    }
+    return { inputTokens, outputTokens };
+  } catch {
+    return null;
+  }
+}
+
+// 批量刷新所有 session 的 token 用量（后台定时任务）
+async function refreshAllTokenStats() {
+  const now = Date.now();
+  for (const [sid, m] of sessionMetrics) {
+    // 超过 5 分钟没活动的 session 不频繁刷新
+    const staleSec = (now - m.lastActiveAt) / 1000;
+    const refreshInterval = staleSec > 300 ? 300000 : 60000;
+    if (now - m.lastFetchedAt < refreshInterval) continue;
+
+    const result = await fetchSessionTokens(sid);
+    if (result) {
+      m.inputTokens  = result.inputTokens;
+      m.outputTokens = result.outputTokens;
+      m.lastFetchedAt = Date.now();
+    }
+  }
+}
+
+// 每分钟刷新一次 token 统计
+setInterval(() => { refreshAllTokenStats().catch(() => {}); }, 60000);
 
 // ─── 工具函数 ─────────────────────────────────────────────────
 
@@ -588,8 +812,10 @@ async function resolveOpencodeSession(n8nSessionId, model, rejectOnHTTPError = f
     if (validId) {
       sessionMap.set(validId, opencodeSessionId);
       console.log(`[phase] create-session ${elapsed}ms  n8n:${validId.slice(0,20)} -> opencode:${opencodeSessionId}`);
+      getOrCreateMetrics(opencodeSessionId, validId);
     } else {
       console.log(`[phase] create-session ${elapsed}ms  n8n:(no sessionId) -> opencode:${opencodeSessionId}`);
+      getOrCreateMetrics(opencodeSessionId, null);
     }
 
     // 新建 session 时，若有 system prompt，作为第一条消息注入（只注入一次，后续轮次不重复）
@@ -654,8 +880,12 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model, syst
     // 头已在函数入口发出，此函数保留作为兼容调用点
   };
 
+  const turnStartedAt = recordTurnStart(opencodeSessionId, n8nSessionId);
+  // 每轮请求的唯一 ID，用于日志追踪，排查对话错乱
+  const requestId = `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+  console.log(`[request] start  id=${requestId}  session=${opencodeSessionId}  msgId=${userMessageID}`);
+
   let closed = false;
-  let eventReq = null;
   let fullText = "";
   let receivedAnyDelta = false;
   let completed = false;
@@ -680,8 +910,6 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model, syst
 
   // 静默超时：有 delta 输出后，若超过 SILENCE_TIMEOUT_MS 没有新 delta，认为 opencode 已暂停
   // 主要用于捕获 playbook manual_gate 后 opencode 停止推送但不发 idle 事件的情况
-  const MESSAGE_POST_TIMEOUT_MS = Math.max(10000, parseInt(process.env.BRIDGE_MESSAGE_TIMEOUT_MS || "300000", 10) || 300000);
-const SILENCE_TIMEOUT_MS = Math.max(0, parseInt(process.env.BRIDGE_SILENCE_TIMEOUT_MS || "0", 10) || 0);
   const silenceChecker = setInterval(() => {
     if (closed || completed || !receivedAnyDelta) return;
     if (lastDeltaAt > 0 && Date.now() - lastDeltaAt > SILENCE_TIMEOUT_MS) {
@@ -725,9 +953,10 @@ const SILENCE_TIMEOUT_MS = Math.max(0, parseInt(process.env.BRIDGE_SILENCE_TIMEO
   const cleanup = () => {
     if (heartbeat) clearInterval(heartbeat);
     clearInterval(silenceChecker);
-    if (eventReq) {
-      eventReq.destroy();
-      eventReq = null;
+    if (subId !== null) {
+      globalEventBus.unsubscribe(subId);
+      console.log(`[phase] unsubscribed  id=${requestId}  session=${opencodeSessionId}  subId=${subId}  remainingSubs=${globalEventBus.subscribers.size}`);
+      subId = null;
     }
   };
 
@@ -746,10 +975,12 @@ const SILENCE_TIMEOUT_MS = Math.max(0, parseInt(process.env.BRIDGE_SILENCE_TIMEO
 
   const emitDelta = (text) => {
     if (!text) return;
+    const isFirstDelta = !receivedAnyDelta;
     receivedAnyDelta = true;
     streamDebug(`emit delta session=${opencodeSessionId} len=${text.length} mode=${mode}`);
-    if (!receivedAnyDelta) {
+    if (isFirstDelta) {
       console.log(`[phase] first-delta  elapsed=${Date.now() - startedAt}ms  session=${opencodeSessionId}`);
+      recordFirstDelta(opencodeSessionId, turnStartedAt);
     }
     lastDeltaAt = Date.now();
 
@@ -798,6 +1029,7 @@ const SILENCE_TIMEOUT_MS = Math.max(0, parseInt(process.env.BRIDGE_SILENCE_TIMEO
     if (completed) return;
     completed = true;
     console.log(`[phase] emit-done  elapsed=${Date.now() - startedAt}ms  reason=${reason}  textLen=${fullText.length}  session=${opencodeSessionId}`);
+    recordTurnDone(opencodeSessionId, turnStartedAt, true);
     streamDebug(`emit done session=${opencodeSessionId} fullTextLen=${fullText.length} mode=${mode}`);
 
     const tail = echoFilter.flush();
@@ -845,6 +1077,7 @@ const SILENCE_TIMEOUT_MS = Math.max(0, parseInt(process.env.BRIDGE_SILENCE_TIMEO
 
   const emitError = (message) => {
     console.error(`[phase] emit-error  elapsed=${Date.now() - startedAt}ms  session=${opencodeSessionId}  msg=${message}`);
+    recordTurnDone(opencodeSessionId, turnStartedAt, false);
     streamDebug(`emit error session=${opencodeSessionId} message=${message}`);
     ensureHeadersSent();
 
@@ -878,39 +1111,10 @@ const SILENCE_TIMEOUT_MS = Math.max(0, parseInt(process.env.BRIDGE_SILENCE_TIMEO
   });
 
   try {
-    let resolveStreamReady;
-    let rejectStreamReady;
-    const streamReady = new Promise((resolve, reject) => {
-      resolveStreamReady = resolve;
-      rejectStreamReady = reject;
-    });
+    // 用全局共享 SSE 连接，彻底避免多请求并发时事件串流/错乱
+    let subId = null;
 
-    const eventURL = new URL(`${OPENCODE_BASE}/event`);
-    const eventOptions = {
-      hostname: eventURL.hostname,
-      port: eventURL.port || 80,
-      path: eventURL.pathname + eventURL.search,
-      method: "GET",
-      headers: { Accept: "text/event-stream" },
-    };
-
-    eventReq = http.request(eventOptions, (eventRes) => {
-      if (eventRes.statusCode >= 400) {
-        let upstreamError = "";
-        eventRes.on("data", (chunk) => (upstreamError += chunk.toString("utf8")));
-        eventRes.on("end", () => {
-          rejectStreamReady(new Error(`event stream HTTP ${eventRes.statusCode}: ${upstreamError || "upstream error"}`));
-          if (!closed) {
-            emitError(`event stream HTTP ${eventRes.statusCode}: ${upstreamError || "upstream error"}`);
-            closeStream();
-          }
-        });
-        return;
-      }
-
-      resolveStreamReady();
-
-      const parseChunk = createSSEParser(({ data }) => {
+    const processEvent = ({ data }) => {
         if (closed || !data || typeof data !== "object") return;
 
         const event = data;
@@ -927,21 +1131,22 @@ const SILENCE_TIMEOUT_MS = Math.max(0, parseInt(process.env.BRIDGE_SILENCE_TIMEO
 
           if (info.role === "user" && infoID === userMessageID) {
             promptAccepted = true;
+            turnHasActivity = true;
             return;
           }
 
-          if (info.role === "assistant" && !assistantMessageID && promptAccepted) {
-            assistantMessageID = infoID || assistantMessageID;
-          }
-
+          // 【防错乱】assistantMessageID 必须通过 parentID === userMessageID 精确认领
+          // 不再用宽松的 promptAccepted 条件，避免认领到其他并发请求的 assistant message
           if (info.role === "assistant" && parentID === userMessageID) {
             assistantMessageID = infoID;
+            turnHasActivity = true;
             if (info.time && info.time.completed) {
               finalizeFromEvent("assistant-parent-completed");
             }
             return;
           }
 
+          // 已认领的 assistant message 完成事件
           if (assistantMessageID && infoID === assistantMessageID && info.time && info.time.completed) {
             finalizeFromEvent("assistant-message-completed");
           }
@@ -956,11 +1161,16 @@ const SILENCE_TIMEOUT_MS = Math.max(0, parseInt(process.env.BRIDGE_SILENCE_TIMEO
           if (partSessionID !== opencodeSessionId || part.type !== "text") return;
           if (partMessageID === userMessageID) return;
 
+          // assistantMessageID 认领：事件已由 _dispatch 按 sessionId 预过滤，
+          // 只要不是 user 消息的 part 就可以安全认领
           if (!assistantMessageID && partMessageID && partMessageID !== userMessageID) {
             assistantMessageID = partMessageID;
+            turnHasActivity = true;
           }
 
-          if (assistantMessageID && partMessageID && partMessageID !== assistantMessageID) return;
+          // 未认领到 assistantMessageID 则忽略
+          if (!assistantMessageID) return;
+          if (partMessageID !== assistantMessageID) return;
 
           let delta = typeof props.delta === "string" ? props.delta : "";
           if (!delta && typeof part.text === "string" && part.text.length > fullText.length) {
@@ -994,20 +1204,23 @@ const SILENCE_TIMEOUT_MS = Math.max(0, parseInt(process.env.BRIDGE_SILENCE_TIMEO
         if (type === "session.status" && sessionID === opencodeSessionId) {
           // opencode 进入 waiting 状态说明是 manual_gate，立即结束当前流
           const statusType = props.status && props.status.type;
-          const canFinalize = messageAccepted || turnHasActivity || receivedAnyDelta || !!assistantMessageID;
+          // 【防错乱】必须 promptAccepted，确保是本轮消息触发的 idle/waiting
+          const canFinalize = promptAccepted && (messageAccepted || turnHasActivity || receivedAnyDelta || !!assistantMessageID);
           if ((statusType === "idle" || statusType === "waiting") && canFinalize) {
             finalizeFromEvent(`session-status-${statusType}`);
+          } else if (BRIDGE_STREAM_DEBUG && (statusType === "idle" || statusType === "waiting")) {
+            streamDebug(`skip session.status ${statusType}  promptAccepted=${promptAccepted}  session=${opencodeSessionId}`);
           }
           return;
         }
 
-        if (type === "session.idle" && sessionID === opencodeSessionId && (messageAccepted || turnHasActivity || receivedAnyDelta || !!assistantMessageID)) {
+        if (type === "session.idle" && sessionID === opencodeSessionId && promptAccepted && (messageAccepted || turnHasActivity || receivedAnyDelta || !!assistantMessageID)) {
           finalizeFromEvent("session-idle");
           return;
         }
 
         // opencode 专用：session 进入等待用户输入状态（playbook manual_gate）
-        if (type === "session.waiting" && sessionID === opencodeSessionId && (messageAccepted || turnHasActivity || receivedAnyDelta || !!assistantMessageID)) {
+        if (type === "session.waiting" && sessionID === opencodeSessionId && promptAccepted && (messageAccepted || turnHasActivity || receivedAnyDelta || !!assistantMessageID)) {
           console.log(`[manual-gate] session.waiting event, closing stream session=${opencodeSessionId}`);
           finalizeFromEvent("session-waiting");
           return;
@@ -1024,37 +1237,15 @@ const SILENCE_TIMEOUT_MS = Math.max(0, parseInt(process.env.BRIDGE_SILENCE_TIMEO
             closeStream();
           }
         }
-      });
+    };
 
-      eventRes.on("data", parseChunk);
-      eventRes.on("end", () => {
-        if (!closed) {
-          emitError("upstream event stream ended unexpectedly");
-          closeStream();
-        }
-      });
-    });
+    // 订阅全局事件总线，只接收本 session 的事件
+    subId = globalEventBus.subscribe(opencodeSessionId, processEvent);
+    console.log(`[phase] subscribed  id=${requestId}  session=${opencodeSessionId}  subId=${subId}  totalSubs=${globalEventBus.subscribers.size}`);
 
-    eventReq.on("error", (err) => {
-      rejectStreamReady(err);
-      if (!closed) {
-        emitError(`event stream error: ${err.message}`);
-        closeStream();
-      }
-    });
-
-    eventReq.setTimeout(300000, () => {
-      eventReq.destroy(new Error("event stream timeout"));
-    });
-
-    eventReq.end();
-
-    const t_event = Date.now();
-    await Promise.race([
-      streamReady,
-      new Promise((_, reject) => setTimeout(() => reject(new Error("event stream connect timeout")), 10000)),
-    ]);
-    console.log(`[phase] event-stream-ready ${Date.now() - t_event}ms  session=${opencodeSessionId}`);
+    // promptAccepted = true 必须在发送消息之前设置
+    // 事件流在消息发出后立刻开始推送，晚于消息发出设置会导致早期 delta 被丢弃
+    promptAccepted = true;
 
     const t_msg = Date.now();
     console.log(`[phase] sending-message  session=${opencodeSessionId}  prompt=${prompt.slice(0, 60)}`);
@@ -1127,12 +1318,11 @@ const SILENCE_TIMEOUT_MS = Math.max(0, parseInt(process.env.BRIDGE_SILENCE_TIMEO
 
         if (err && err.message === "Request timeout") {
           evictSessionMapping("message-timeout");
+          recordTimeout(opencodeSessionId);
         }
         emitError(err.message || "message request failed");
         closeStream();
       });
-
-    promptAccepted = true;
 
     // 最长等待 5 分钟；若上游完全无有效消息则返回错误，避免无限挂起
     setTimeout(() => {
@@ -1146,6 +1336,295 @@ const SILENCE_TIMEOUT_MS = Math.max(0, parseInt(process.env.BRIDGE_SILENCE_TIMEO
     emitError(err.message);
     closeStream();
   }
+}
+
+// ─── 工具：时间格式化 ─────────────────────────────────────────
+
+function formatDuration(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ${m % 60}m`;
+  return `${Math.floor(h / 24)}d ${h % 24}h`;
+}
+
+function formatTokens(n) {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + "M";
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + "K";
+  return String(n);
+}
+
+function timeAgo(ts) {
+  if (!ts) return "-";
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 5) return "刚刚";
+  if (s < 60) return `${s}秒前`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}分钟前`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}小时前`;
+  return `${Math.floor(h / 24)}天前`;
+}
+
+// ─── Dashboard HTML ───────────────────────────────────────────
+
+function getDashboardHTML() {
+  return `<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OpenCode Bridge Dashboard</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
+  .topbar{background:#1a1d27;border-bottom:1px solid #2d3148;padding:16px 24px;display:flex;align-items:center;gap:16px}
+  .topbar h1{font-size:16px;font-weight:600;color:#fff}
+  .topbar .badge{background:#6366f1;color:#fff;font-size:11px;padding:2px 8px;border-radius:20px}
+  .refresh-btn{margin-left:auto;background:#6366f1;color:#fff;border:none;padding:7px 16px;border-radius:8px;cursor:pointer;font-size:13px;display:flex;align-items:center;gap:6px}
+  .refresh-btn:hover{background:#5558e3}
+  .refresh-btn.loading{opacity:.6;pointer-events:none}
+  .container{padding:24px;max-width:1400px;margin:0 auto}
+  .summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:28px}
+  .card{background:#1a1d27;border:1px solid #2d3148;border-radius:12px;padding:20px}
+  .card-label{font-size:12px;color:#8892b0;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px}
+  .card-value{font-size:28px;font-weight:700;color:#e2e8f0}
+  .card-value.green{color:#34d399}
+  .card-value.blue{color:#60a5fa}
+  .card-value.amber{color:#fbbf24}
+  .card-value.red{color:#f87171}
+  .card-sub{font-size:12px;color:#8892b0;margin-top:4px}
+  .section-title{font-size:14px;font-weight:600;color:#a0aec0;margin-bottom:14px;display:flex;align-items:center;gap:8px}
+  .section-title .dot{width:6px;height:6px;border-radius:50%;background:#6366f1}
+  table{width:100%;border-collapse:collapse;background:#1a1d27;border:1px solid #2d3148;border-radius:12px;overflow:hidden}
+  th{text-align:left;padding:12px 16px;font-size:11px;font-weight:600;color:#8892b0;text-transform:uppercase;letter-spacing:.05em;background:#151721;border-bottom:1px solid #2d3148}
+  td{padding:12px 16px;font-size:13px;border-bottom:1px solid #1e2235;vertical-align:middle}
+  tr:last-child td{border-bottom:none}
+  tr:hover td{background:#1e2235}
+  .session-id{font-family:monospace;font-size:11px;color:#8892b0}
+  .tag{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:500}
+  .tag-active{background:#1a2e1a;color:#34d399;border:1px solid #2d4a2d}
+  .tag-idle{background:#1e2235;color:#8892b0;border:1px solid #2d3148}
+  .tag-error{background:#2e1a1a;color:#f87171;border:1px solid #4a2d2d}
+  .token-bar-wrap{display:flex;align-items:center;gap:8px}
+  .token-bar{height:6px;background:#2d3148;border-radius:3px;flex:1;max-width:100px;overflow:hidden}
+  .token-bar-fill{height:100%;background:#6366f1;border-radius:3px;transition:width .3s}
+  .num{font-variant-numeric:tabular-nums}
+  .empty{text-align:center;padding:48px;color:#4a5568}
+  .last-refresh{font-size:12px;color:#4a5568;margin-top:12px;text-align:right}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .spin{animation:spin .8s linear infinite;display:inline-block}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <h1>🌉 OpenCode Bridge</h1>
+  <span class="badge" id="status-badge">Loading...</span>
+  <button class="refresh-btn" onclick="loadStats(true)" id="refresh-btn">
+    <span id="refresh-icon">⟳</span> 刷新
+  </button>
+</div>
+<div class="container">
+  <div class="summary-grid" id="summary-grid">
+    <div class="card"><div class="card-label">加载中</div><div class="card-value">...</div></div>
+  </div>
+  <div class="section-title"><span class="dot"></span> Session 列表</div>
+  <div id="sessions-table-wrap">
+    <div class="empty">加载中...</div>
+  </div>
+  <div class="last-refresh" id="last-refresh"></div>
+</div>
+
+<script>
+let maxTotalTokens = 1;
+
+function fmt(n) {
+  if (!n) return "0";
+  if (n >= 1e6) return (n/1e6).toFixed(2)+"M";
+  if (n >= 1e3) return (n/1e3).toFixed(1)+"K";
+  return String(n);
+}
+function fmtMs(ms) {
+  if (!ms) return "-";
+  if (ms < 1000) return ms+"ms";
+  return (ms/1000).toFixed(1)+"s";
+}
+function timeAgo(ts) {
+  if (!ts) return "-";
+  const s = Math.floor((Date.now()-ts)/1000);
+  if (s<5) return "刚刚";
+  if (s<60) return s+"秒前";
+  if (s<3600) return Math.floor(s/60)+"分钟前";
+  if (s<86400) return Math.floor(s/3600)+"小时前";
+  return Math.floor(s/86400)+"天前";
+}
+function fmtDur(ms) {
+  const s=Math.floor(ms/1000);
+  if(s<60) return s+"s";
+  const m=Math.floor(s/60);
+  if(m<60) return m+"m "+s%60+"s";
+  const h=Math.floor(m/60);
+  if(h<24) return h+"h "+m%60+"m";
+  return Math.floor(h/24)+"d "+h%24+"h";
+}
+function statusTag(sess) {
+  if (sess.errors > 0 && sess.turns === 0) return '<span class="tag tag-error">异常</span>';
+  const idle = sess.idleSec;
+  if (idle < 120) return '<span class="tag tag-active">活跃</span>';
+  return '<span class="tag tag-idle">空闲</span>';
+}
+
+async function loadStats(force) {
+  const btn = document.getElementById("refresh-btn");
+  const icon = document.getElementById("refresh-icon");
+  btn.classList.add("loading");
+  icon.classList.add("spin");
+  icon.textContent = "⟳";
+
+  try {
+    if (force) {
+      await fetch("/stats/refresh");
+      await new Promise(r => setTimeout(r, 1500));
+    }
+    const r = await fetch("/stats");
+    const data = await r.json();
+    renderDashboard(data);
+  } catch(e) {
+    document.getElementById("sessions-table-wrap").innerHTML =
+      '<div class="empty">加载失败: ' + e.message + '</div>';
+  } finally {
+    btn.classList.remove("loading");
+    icon.classList.remove("spin");
+    icon.textContent = "⟳";
+    document.getElementById("last-refresh").textContent =
+      "最后刷新：" + new Date().toLocaleTimeString("zh-CN");
+  }
+}
+
+function renderDashboard(data) {
+  const b = data.bridge;
+  const sessions = data.sessions || [];
+
+  // Update badge
+  document.getElementById("status-badge").textContent =
+    b.activeSessionMappings + " active sessions";
+
+  // Summary cards
+  const totalIn = sessions.reduce((a,s)=>a+s.inputTokens,0);
+  const totalOut = sessions.reduce((a,s)=>a+s.outputTokens,0);
+  const totalTokens = totalIn + totalOut;
+  const avgTtft = sessions.length
+    ? Math.round(sessions.filter(s=>s.avgTtftMs).reduce((a,s)=>a+s.avgTtftMs,0)/sessions.filter(s=>s.avgTtftMs).length)
+    : 0;
+
+  document.getElementById("summary-grid").innerHTML = \`
+    <div class="card">
+      <div class="card-label">运行时长</div>
+      <div class="card-value blue">\${fmtDur(b.uptime)}</div>
+      <div class="card-sub">共处理 \${b.requests.totalRequests} 次请求</div>
+    </div>
+    <div class="card">
+      <div class="card-label">成功率</div>
+      <div class="card-value green">\${b.successRate}</div>
+      <div class="card-sub">成功 \${b.requests.successRequests} / 失败 \${b.requests.errorRequests}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">超时次数</div>
+      <div class="card-value \${b.requests.timeoutRequests>0?"amber":"green"}">\${b.requests.timeoutRequests}</div>
+      <div class="card-sub">占总请求 \${b.requests.totalRequests>0?((b.requests.timeoutRequests/b.requests.totalRequests)*100).toFixed(1):0}%</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Session 总数</div>
+      <div class="card-value">\${b.totalTrackedSessions}</div>
+      <div class="card-sub">活跃映射 \${b.activeSessionMappings} 个</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Input Token</div>
+      <div class="card-value blue">\${fmt(totalIn)}</div>
+      <div class="card-sub">Output: \${fmt(totalOut)}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">总 Token 用量</div>
+      <div class="card-value amber">\${fmt(totalTokens)}</div>
+      <div class="card-sub">跨 \${sessions.length} 个 session</div>
+    </div>
+    <div class="card">
+      <div class="card-label">平均首Token延迟</div>
+      <div class="card-value \${avgTtft>5000?"amber":avgTtft>2000?"blue":"green"}">\${fmtMs(avgTtft)}</div>
+      <div class="card-sub">TTFT (Time to First Token)</div>
+    </div>
+  \`;
+
+  // Session table
+  if (sessions.length === 0) {
+    document.getElementById("sessions-table-wrap").innerHTML =
+      '<div class="empty">暂无 Session 数据</div>';
+    return;
+  }
+
+  maxTotalTokens = Math.max(1, ...sessions.map(s=>s.totalTokens));
+
+  const rows = sessions.map(s => {
+    const barWidth = maxTotalTokens > 0 ? Math.round((s.totalTokens/maxTotalTokens)*100) : 0;
+    const sid = s.opencodeSessionId || "-";
+    const shortSid = sid.length > 20 ? sid.slice(0,8)+"…"+sid.slice(-6) : sid;
+    const n8nSid = s.n8nSessionId ? s.n8nSessionId.slice(0,16)+"…" : "-";
+    return \`<tr>
+      <td>
+        <span class="session-id" title="\${sid}">\${shortSid}</span>
+        <div class="session-id" style="margin-top:3px;font-size:10px;color:#4a5568" title="\${s.n8nSessionId||''}">\${n8nSid}</div>
+      </td>
+      <td>\${statusTag(s)}</td>
+      <td class="num">\${timeAgo(s.lastActiveAt)}</td>
+      <td class="num">\${timeAgo(s.createdAt)}</td>
+      <td class="num">\${s.turns}</td>
+      <td class="num" style="color:\${s.errors>0?'#f87171':'#8892b0'}">\${s.errors}\${s.timeouts>0?' (超时'+s.timeouts+')':''}</td>
+      <td>
+        <div class="token-bar-wrap">
+          <span class="num">\${fmt(s.inputTokens)}</span>
+          <div class="token-bar"><div class="token-bar-fill" style="width:\${barWidth}%;background:#60a5fa"></div></div>
+        </div>
+      </td>
+      <td>
+        <div class="token-bar-wrap">
+          <span class="num">\${fmt(s.outputTokens)}</span>
+          <div class="token-bar"><div class="token-bar-fill" style="width:\${barWidth}%"></div></div>
+        </div>
+      </td>
+      <td class="num" style="color:#fbbf24;font-weight:600">\${fmt(s.totalTokens)}</td>
+      <td class="num">\${fmtMs(s.avgTtftMs)}</td>
+      <td class="num">\${fmtMs(s.avgDurationMs)}</td>
+    </tr>\`;
+  }).join("");
+
+  document.getElementById("sessions-table-wrap").innerHTML = \`
+    <table>
+      <thead><tr>
+        <th>Session ID</th>
+        <th>状态</th>
+        <th>最后活跃</th>
+        <th>创建时间</th>
+        <th>对话轮次</th>
+        <th>错误</th>
+        <th>Input Token</th>
+        <th>Output Token</th>
+        <th>总 Token</th>
+        <th>TTFT 均值</th>
+        <th>响应时长均值</th>
+      </tr></thead>
+      <tbody>\${rows}</tbody>
+    </table>
+  \`;
+}
+
+// 加载数据，每 30 秒自动刷新
+loadStats(false);
+setInterval(() => loadStats(false), 30000);
+</script>
+</body>
+</html>`;
 }
 
 // ─── HTTP Server ──────────────────────────────────────────────
@@ -1397,6 +1876,63 @@ const server = http.createServer(async (req, res) => {
   if (normalizedPath === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ status: "ok", sessions: sessionMap.size, opencode: OPENCODE_BASE }));
+    return;
+  }
+
+  // ── GET /stats (JSON API) ─────────────────────────────────────
+  if (normalizedPath === "/stats") {
+    const uptimeMs = Date.now() - BRIDGE_START_TIME;
+    const sessionsData = [];
+    for (const [sid, m] of sessionMetrics) {
+      sessionsData.push({
+        opencodeSessionId: m.opencodeSessionId,
+        n8nSessionId: m.n8nSessionId,
+        createdAt: m.createdAt,
+        lastActiveAt: m.lastActiveAt,
+        idleSec: Math.round((Date.now() - m.lastActiveAt) / 1000),
+        turns: m.turns,
+        errors: m.errors,
+        timeouts: m.timeouts,
+        inputTokens: m.inputTokens,
+        outputTokens: m.outputTokens,
+        totalTokens: m.inputTokens + m.outputTokens,
+        avgTtftMs: avg(m.ttftSamples),
+        avgDurationMs: avg(m.durationSamples),
+        lastFetchedAt: m.lastFetchedAt,
+        inSessionMap: [...sessionMap.values()].includes(sid),
+      });
+    }
+    sessionsData.sort((a, b) => b.lastActiveAt - a.lastActiveAt);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      bridge: {
+        uptime: uptimeMs,
+        uptimeHuman: formatDuration(uptimeMs),
+        startedAt: BRIDGE_START_TIME,
+        activeSessionMappings: sessionMap.size,
+        totalTrackedSessions: sessionMetrics.size,
+        requests: stats,
+        successRate: stats.totalRequests > 0
+          ? ((stats.successRequests / stats.totalRequests) * 100).toFixed(1) + "%"
+          : "n/a",
+      },
+      sessions: sessionsData,
+    }, null, 2));
+    return;
+  }
+
+  // ── GET /stats/refresh (force refresh token counts) ───────────
+  if (normalizedPath === "/stats/refresh") {
+    refreshAllTokenStats().catch(() => {});
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, message: "Token refresh triggered" }));
+    return;
+  }
+
+  // ── GET /dashboard ────────────────────────────────────────────
+  if (normalizedPath === "/dashboard" || normalizedPath === "/") {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(getDashboardHTML());
     return;
   }
 
