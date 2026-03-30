@@ -23,8 +23,6 @@ const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "zzz/claude-sonnet-4-5-202509
 // FIX: 默认改为 4，避免整个响应作为单个 chunk 发出
 const OPENAI_STREAM_CHUNK_SIZE = Math.max(0, parseInt(process.env.OPENAI_STREAM_CHUNK_SIZE || "4", 10) || 0);
 const OPENAI_STREAM_CHUNK_DELAY_MS = Math.max(0, parseInt(process.env.OPENAI_STREAM_CHUNK_DELAY_MS || "10", 10) || 0);
-const MESSAGE_POST_TIMEOUT_MS = Math.max(10000, parseInt(process.env.BRIDGE_MESSAGE_TIMEOUT_MS || "300000", 10) || 300000);
-const SILENCE_TIMEOUT_MS = Math.max(0, parseInt(process.env.BRIDGE_SILENCE_TIMEOUT_MS || "0", 10) || 0);
 const ENABLE_LEADING_ECHO_FILTER = String(process.env.ENABLE_LEADING_ECHO_FILTER || "false").toLowerCase() === "true";
 const BRIDGE_STREAM_DEBUG = String(process.env.BRIDGE_STREAM_DEBUG || "false").toLowerCase() === "true";
 
@@ -307,42 +305,41 @@ function messageContentToText(content) {
 }
 
 function buildPromptFromMessages(messages) {
+  // 核心原则：OpenCode session 有自己的对话记忆，不需要重复传入历史。
+  // bridge 只取最后一条 user 消息发给 OpenCode，避免 token 爆炸。
+  //
+  // n8n AI Agent 每次调用都携带完整 messages[]（含所有历史轮次），
+  // 如果把这些历史全部拼成 prompt 传给 OpenCode：
+  //   ① OpenCode session 已有历史 → 历史被传两遍
+  //   ② system prompt 每轮重复注入 → 额外 token 浪费
+  //   ③ 10 轮对话 token 呈平方级增长 → 9000万 token 的根本原因
   if (!Array.isArray(messages)) return "";
 
-  const systemBlocks = [];
+  // 只取最后一条 user 消息
   let lastUserText = "";
-  let lastFallbackText = "";
-
   for (const message of messages) {
     if (!message || typeof message !== "object") continue;
-    const role = typeof message.role === "string" ? message.role : "user";
+    const role = typeof message.role === "string" ? message.role : "";
+    if (role !== "user") continue;
     const text = messageContentToText(message.content);
-    if (!text) continue;
-
-    if (role === "system" || role === "developer") {
-      systemBlocks.push(text);
-      continue;
-    }
-
-    if (role === "user") {
-      lastUserText = text;
-      continue;
-    }
-
-    // 兜底：如果没有 user 消息，至少使用最后一条可读文本
-    lastFallbackText = text;
+    if (text && text.trim()) lastUserText = text.trim();
   }
 
-  const mainText = lastUserText || lastFallbackText;
-  if (!mainText) {
-    return systemBlocks.join("\n\n");
-  }
+  return lastUserText;
+}
 
-  if (systemBlocks.length === 0) {
-    return mainText;
+// 仅在第一次建立 OpenCode session 时注入 system prompt（只发一次，不随每轮重复）
+function extractSystemPrompt(messages) {
+  if (!Array.isArray(messages)) return "";
+  const blocks = [];
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+    const role = typeof message.role === "string" ? message.role : "";
+    if (role !== "system" && role !== "developer") continue;
+    const text = messageContentToText(message.content);
+    if (text && text.trim()) blocks.push(text.trim());
   }
-
-  return `${systemBlocks.join("\n\n")}\n\n${mainText}`;
+  return blocks.join("\n\n");
 }
 
 // 从 messages 数组里提取第一条 user 消息内容，用于生成稳定的 session fingerprint
@@ -411,11 +408,13 @@ function extractOpenAIInput(payload = {}) {
     console.warn("[session-debug] request keys:", Object.keys(root).join(", "));
   }
 
+  const systemPrompt = extractSystemPrompt(Array.isArray(root.messages) ? root.messages : []);
+
   return {
     prompt: toPromptText(promptRaw),
     n8nSessionId: normalizeInputString(sessionIdRaw),
     model: normalizeInputString(root.model),
-    // 透传完整 messages 供后续使用
+    systemPrompt,
     messages: Array.isArray(root.messages) ? root.messages : [],
   };
 }
@@ -573,7 +572,7 @@ function extractN8nInput(payload = {}) {
   };
 }
 
-async function resolveOpencodeSession(n8nSessionId, model, rejectOnHTTPError = false) {
+async function resolveOpencodeSession(n8nSessionId, model, rejectOnHTTPError = false, systemPrompt = "") {
   const validId = normalizeSessionCacheKey(n8nSessionId);
 
   let opencodeSessionId = validId ? sessionMap.get(validId) : undefined;
@@ -592,13 +591,25 @@ async function resolveOpencodeSession(n8nSessionId, model, rejectOnHTTPError = f
     } else {
       console.log(`[phase] create-session ${elapsed}ms  n8n:(no sessionId) -> opencode:${opencodeSessionId}`);
     }
+
+    // 新建 session 时，若有 system prompt，作为第一条消息注入（只注入一次，后续轮次不重复）
+    if (systemPrompt && systemPrompt.trim()) {
+      console.log(`[phase] inject-system-prompt  len=${systemPrompt.length}  session=${opencodeSessionId}`);
+      await fetchJSON(`${OPENCODE_BASE}/session/${opencodeSessionId}/message`, {
+        method: "POST",
+        body: { parts: [{ type: "text", text: `[SYSTEM]
+${systemPrompt.trim()}` }] },
+        rejectOnHTTPError: false,
+        timeoutMs: 30000,
+      });
+    }
   } else {
-    console.log(`[phase] reuse-session  n8n:${validId.slice(0,20)} -> opencode:${opencodeSessionId}`);
+    console.log(`[phase] reuse-session  n8n:${validId ? validId.slice(0,20) : "none"} -> opencode:${opencodeSessionId}`);
   }
   return opencodeSessionId;
 }
 
-async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, options = {}) {
+async function handleStreamRequest(req, res, { prompt, n8nSessionId, model, systemPrompt = "" }, options = {}) {
   const mode = options.mode === "openai" ? "openai" : "bridge";
   const completionId = options.completionId || createCompletionID();
   const created = options.created || Math.floor(Date.now() / 1000);
@@ -613,7 +624,7 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
   let opencodeSessionId;
   const sessionCacheKey = normalizeSessionCacheKey(n8nSessionId);
   try {
-    opencodeSessionId = await resolveOpencodeSession(n8nSessionId, model, true);
+    opencodeSessionId = await resolveOpencodeSession(n8nSessionId, model, true, systemPrompt);
     streamDebug(`start mode=${mode} session=${opencodeSessionId} promptLen=${prompt.length}`);
   } catch (err) {
     res.writeHead(500, { "Content-Type": "application/json" });
@@ -650,6 +661,7 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
   let completed = false;
   let assistantMessageID = null;
   const userMessageID = createMessageID();
+  let promptAccepted = false;
   let messageAccepted = false;
   let turnHasActivity = false;
   const echoFilter = ENABLE_LEADING_ECHO_FILTER ? createLeadingEchoFilter(prompt) : createPassThroughFilter();
@@ -658,13 +670,6 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
   const startedAt = Date.now();
   // 最后一次收到 delta 的时间，用于静默超时检测（playbook manual_gate 后 opencode 停止推送）
   let lastDeltaAt = 0;
-
-  const evictSessionMapping = (reason) => {
-    if (!sessionCacheKey || !opencodeSessionId) return;
-    if (sessionMap.get(sessionCacheKey) !== opencodeSessionId) return;
-    sessionMap.delete(sessionCacheKey);
-    console.warn(`[session-map] evict n8n:${sessionCacheKey.slice(0, 20)} -> opencode:${opencodeSessionId}  reason=${reason}`);
-  };
 
   // 所有模式都发 SSE comment 心跳，间隔 5s
   // openai SDK 规范要求忽略 SSE comment（以 ":" 开头的行），n8n 也遵循此规范
@@ -675,8 +680,9 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
 
   // 静默超时：有 delta 输出后，若超过 SILENCE_TIMEOUT_MS 没有新 delta，认为 opencode 已暂停
   // 主要用于捕获 playbook manual_gate 后 opencode 停止推送但不发 idle 事件的情况
+  const MESSAGE_POST_TIMEOUT_MS = Math.max(10000, parseInt(process.env.BRIDGE_MESSAGE_TIMEOUT_MS || "300000", 10) || 300000);
+const SILENCE_TIMEOUT_MS = Math.max(0, parseInt(process.env.BRIDGE_SILENCE_TIMEOUT_MS || "0", 10) || 0);
   const silenceChecker = setInterval(() => {
-    if (SILENCE_TIMEOUT_MS <= 0) return;
     if (closed || completed || !receivedAnyDelta) return;
     if (lastDeltaAt > 0 && Date.now() - lastDeltaAt > SILENCE_TIMEOUT_MS) {
       console.log(`[silence-timeout] no delta for ${SILENCE_TIMEOUT_MS}ms, closing stream session=${opencodeSessionId}`);
@@ -709,6 +715,13 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
     return writeQueue;
   };
 
+  const evictSessionMapping = (reason) => {
+    if (!sessionCacheKey || !opencodeSessionId) return;
+    if (sessionMap.get(sessionCacheKey) !== opencodeSessionId) return;
+    sessionMap.delete(sessionCacheKey);
+    console.warn(`[session-map] evict n8n:${sessionCacheKey.slice(0, 20)} -> opencode:${opencodeSessionId}  reason=${reason}`);
+  };
+
   const cleanup = () => {
     if (heartbeat) clearInterval(heartbeat);
     clearInterval(silenceChecker);
@@ -733,10 +746,9 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
 
   const emitDelta = (text) => {
     if (!text) return;
-    const isFirstDelta = !receivedAnyDelta;
     receivedAnyDelta = true;
     streamDebug(`emit delta session=${opencodeSessionId} len=${text.length} mode=${mode}`);
-    if (isFirstDelta) {
+    if (!receivedAnyDelta) {
       console.log(`[phase] first-delta  elapsed=${Date.now() - startedAt}ms  session=${opencodeSessionId}`);
     }
     lastDeltaAt = Date.now();
@@ -851,11 +863,6 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
     });
   };
 
-  res.on("close", () => {
-    closed = true;
-    cleanup();
-  });
-
   const finalizeFromEvent = (reason) => {
     if (!receivedAnyDelta && !fullText) {
       streamDebug(`skip event-done reason=${reason} session=${opencodeSessionId} no-content-yet`);
@@ -864,6 +871,11 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
     emitDone(reason);
     closeStream();
   };
+
+  res.on("close", () => {
+    closed = true;
+    cleanup();
+  });
 
   try {
     let resolveStreamReady;
@@ -914,11 +926,11 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
           const parentID = pickFirst(info, ["parentID", "parentId", "parent_id"]);
 
           if (info.role === "user" && infoID === userMessageID) {
-            turnHasActivity = true;
+            promptAccepted = true;
             return;
           }
 
-          if (info.role === "assistant" && !assistantMessageID && (messageAccepted || turnHasActivity || receivedAnyDelta)) {
+          if (info.role === "assistant" && !assistantMessageID && promptAccepted) {
             assistantMessageID = infoID || assistantMessageID;
           }
 
@@ -947,8 +959,6 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
           if (!assistantMessageID && partMessageID && partMessageID !== userMessageID) {
             assistantMessageID = partMessageID;
           }
-
-          turnHasActivity = true;
 
           if (assistantMessageID && partMessageID && partMessageID !== assistantMessageID) return;
 
@@ -987,8 +997,6 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
           const canFinalize = messageAccepted || turnHasActivity || receivedAnyDelta || !!assistantMessageID;
           if ((statusType === "idle" || statusType === "waiting") && canFinalize) {
             finalizeFromEvent(`session-status-${statusType}`);
-          } else if ((statusType === "idle" || statusType === "waiting") && BRIDGE_STREAM_DEBUG) {
-            streamDebug(`skip session.status ${statusType} session=${opencodeSessionId} no-turn-activity`);
           }
           return;
         }
@@ -1050,7 +1058,7 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
 
     const t_msg = Date.now();
     console.log(`[phase] sending-message  session=${opencodeSessionId}  prompt=${prompt.slice(0, 60)}`);
-    // message POST 在部分模型上会阻塞较久，超时改为可配置，避免误报 Request timeout
+    // message POST 超时由 MESSAGE_POST_TIMEOUT_MS 控制（默认 300s，可通过 BRIDGE_MESSAGE_TIMEOUT_MS 调整）
     const messagePromise = fetchJSON(`${OPENCODE_BASE}/session/${opencodeSessionId}/message`, {
       method: "POST",
       body: { messageID: userMessageID, parts: [{ type: "text", text: prompt }] },
@@ -1090,7 +1098,7 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
           return;
         }
 
-        emitDone("message-request-complete");
+        emitDone();
         closeStream();
       })
       .catch(async (err) => {
@@ -1123,6 +1131,8 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model }, op
         emitError(err.message || "message request failed");
         closeStream();
       });
+
+    promptAccepted = true;
 
     // 最长等待 5 分钟；若上游完全无有效消息则返回错误，避免无限挂起
     setTimeout(() => {
@@ -1206,7 +1216,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const { prompt, n8nSessionId, model } = extractOpenAIInput(parsed);
+      const { prompt, n8nSessionId, model, systemPrompt } = extractOpenAIInput(parsed);
       if (!prompt) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: { message: "messages or prompt is required", type: "invalid_request_error" } }));
@@ -1221,7 +1231,7 @@ const server = http.createServer(async (req, res) => {
         await handleStreamRequest(
           req,
           res,
-          { prompt, n8nSessionId, model: responseModel },
+          { prompt, n8nSessionId, model: responseModel, systemPrompt },
           {
             mode: "openai",
             completionId,
@@ -1233,7 +1243,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       try {
-        const opencodeSessionId = await resolveOpencodeSession(n8nSessionId, responseModel, true);
+        const opencodeSessionId = await resolveOpencodeSession(n8nSessionId, responseModel, true, systemPrompt);
         console.log(`[OpenAI兼容消息] ${prompt.slice(0, 80)}`);
 
         const msgResponse = await fetchJSON(`${OPENCODE_BASE}/session/${opencodeSessionId}/message`, {
