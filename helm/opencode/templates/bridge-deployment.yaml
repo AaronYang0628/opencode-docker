@@ -61,6 +61,10 @@ spec:
               value: {{ .Values.bridge.env.openaiStreamChunkSize | quote }}
             - name: OPENAI_STREAM_CHUNK_DELAY_MS
               value: {{ .Values.bridge.env.openaiStreamChunkDelayMs | quote }}
+            - name: BRIDGE_MESSAGE_TIMEOUT_MS
+              value: {{ .Values.bridge.env.bridgeMessageTimeoutMs | quote }}
+            - name: BRIDGE_SILENCE_TIMEOUT_MS
+              value: {{ .Values.bridge.env.bridgeSilenceTimeoutMs | quote }}
             - name: ENABLE_LEADING_ECHO_FILTER
               value: {{ .Values.bridge.env.enableLeadingEchoFilter | quote }}
             - name: BRIDGE_STREAM_DEBUG

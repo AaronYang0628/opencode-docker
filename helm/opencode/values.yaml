@@ -369,8 +369,12 @@ bridge:
     defaultModel: "zzz/claude-sonnet-4-5-20250929-thinking"
     bridgePort: "3100"
     # Optional stream smoothing for OpenAI-compatible SSE output
-    openaiStreamChunkSize: "24"
-    openaiStreamChunkDelayMs: "18"
+    openaiStreamChunkSize: "4"
+    openaiStreamChunkDelayMs: "10"
+    # Timeout for POST /session/{id}/message in bridge stream path
+    bridgeMessageTimeoutMs: "300000"
+    # If no new delta arrives for this long, bridge ends stream (0 disables)
+    bridgeSilenceTimeoutMs: "0"
     # Optional leading echo suppression (may delay first visible tokens)
     enableLeadingEchoFilter: "false"
     # Optional stream debug logs for troubleshooting

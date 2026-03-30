@@ -287,8 +287,10 @@ bridge:
     opencodeBase: ""  # Auto-configured to point to main OpenCode service
     defaultModel: "zzz/claude-sonnet-4-5-20250929-thinking"
     bridgePort: "3100"
-    openaiStreamChunkSize: "24"
-    openaiStreamChunkDelayMs: "18"
+    openaiStreamChunkSize: "4"
+    openaiStreamChunkDelayMs: "10"
+    bridgeMessageTimeoutMs: "300000"
+    bridgeSilenceTimeoutMs: "0"
 
   # Service configuration
   service:
