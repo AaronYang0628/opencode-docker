@@ -16,24 +16,30 @@
  */
 
 const http = require("http");
-
-const OPENCODE_BASE = process.env.OPENCODE_BASE || "http://opencode.opencode.svc.cluster.local:4000";
-const BRIDGE_PORT   = parseInt(process.env.BRIDGE_PORT || "3100");
-const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "zzz/claude-sonnet-4-5-20250929-thinking";
-// FIX: 默认改为 4，避免整个响应作为单个 chunk 发出
-const OPENAI_STREAM_CHUNK_SIZE = Math.max(0, parseInt(process.env.OPENAI_STREAM_CHUNK_SIZE || "4", 10) || 0);
-const OPENAI_STREAM_CHUNK_DELAY_MS = Math.max(0, parseInt(process.env.OPENAI_STREAM_CHUNK_DELAY_MS || "10", 10) || 0);
-const ENABLE_LEADING_ECHO_FILTER = String(process.env.ENABLE_LEADING_ECHO_FILTER || "false").toLowerCase() === "true";
-const BRIDGE_STREAM_DEBUG = String(process.env.BRIDGE_STREAM_DEBUG || "false").toLowerCase() === "true";
-const MESSAGE_POST_TIMEOUT_MS = Math.max(10000, parseInt(process.env.BRIDGE_MESSAGE_TIMEOUT_MS || "300000", 10) || 300000);
-const SILENCE_TIMEOUT_MS = Math.max(0, parseInt(process.env.BRIDGE_SILENCE_TIMEOUT_MS || "0", 10) || 0);
-
-// N8N sessionId → OpenCode sessionId 映射（多轮对话）
-const sessionMap = new Map();
+const { getDashboardHTML, formatDuration } = require("./lib/dashboard");
+const {
+  OPENCODE_BASE,
+  BRIDGE_PORT,
+  DEFAULT_MODEL,
+  OPENAI_STREAM_CHUNK_SIZE,
+  OPENAI_STREAM_CHUNK_DELAY_MS,
+  ENABLE_LEADING_ECHO_FILTER,
+  BRIDGE_STREAM_DEBUG,
+  MESSAGE_POST_TIMEOUT_MS,
+  SILENCE_TIMEOUT_MS,
+  SESSION_COOLDOWN_MS,
+  SESSION_IDLE_WAIT_MS,
+} = require("./lib/config");
+const {
+  BRIDGE_START_TIME,
+  sessionMap,
+  sessionQueue,
+  stats,
+  sessionMetrics,
+} = require("./lib/state");
 
 // 每个 OpenCode session 的请求队列：同一 session 同时只允许一个请求在 waitForOpencodeResult 中运行
 // 防止 n8n AI Agent 并发调用 LLM 时多个订阅者争抢同一个 session.idle 事件
-const sessionQueue = new Map(); // opencodeSessionId -> Promise (tail of queue)
 
 function enqueueSessionRequest(queueKey, fn) {
   const prev = sessionQueue.get(queueKey) || Promise.resolve();
@@ -49,10 +55,6 @@ function enqueueSessionRequest(queueKey, fn) {
   sessionQueue.set(queueKey, next.catch(() => {}));
   return next;
 }
-
-// ─── 统计数据 ────────────────────────────────────────────────
-// Bridge 启动时间
-const BRIDGE_START_TIME = Date.now();
 
 // ─── 全局共享 SSE 事件流 ──────────────────────────────────────
 // OpenCode /event 是全局流，包含所有 session 的事件。
@@ -186,17 +188,8 @@ const globalEventBus = {
 // is established, causing events to be missed entirely.
 globalEventBus._connect();
 
-// 请求计数器
-const stats = {
-  totalRequests: 0,
-  successRequests: 0,
-  errorRequests: 0,
-  timeoutRequests: 0,
-};
-
 // 每个 OpenCode session 的详细指标
 // key: opencodeSessionId, value: SessionMetrics
-const sessionMetrics = new Map();
 
 function getOrCreateMetrics(opencodeSessionId, n8nSessionId) {
   if (!sessionMetrics.has(opencodeSessionId)) {
@@ -884,6 +877,39 @@ async function resolveOpencodeSession(n8nSessionId, model, rejectOnHTTPError = f
   return opencodeSessionId;
 }
 
+// 在发消息前主动轮询 OpenCode session 状态，等到 idle 再发
+// 防止上一条消息还在处理中时就发下一条导致串话
+async function waitForSessionIdle(opencodeSessionId, maxWaitMs = SESSION_IDLE_WAIT_MS) {
+  if (maxWaitMs <= 0) return;
+  const deadline = Date.now() + maxWaitMs;
+  const pollInterval = 300;
+  let attempts = 0;
+  while (Date.now() < deadline) {
+    attempts++;
+    try {
+      const sessionInfo = await fetchJSON(`${OPENCODE_BASE}/session/${opencodeSessionId}`, {
+        timeoutMs: 3000,
+      });
+      // OpenCode session status: check if it's idle/not busy
+      // The session object may have a status or running field
+      const status = sessionInfo && (sessionInfo.status || sessionInfo.state || "");
+      const isIdle = !status || status === "idle" || status === "ready" || status === "completed";
+      if (isIdle) {
+        if (attempts > 1) {
+          console.log(`[idle-wait] session idle after ${attempts} polls  session=${opencodeSessionId}`);
+        }
+        return;
+      }
+      console.log(`[idle-wait] session busy (${status}), waiting...  session=${opencodeSessionId}  attempt=${attempts}`);
+    } catch {
+      // If we can't fetch status, assume idle and proceed
+      return;
+    }
+    await sleep(pollInterval);
+  }
+  console.warn(`[idle-wait] gave up waiting for idle  session=${opencodeSessionId}  waited=${maxWaitMs}ms`);
+}
+
 // ─── waitForOpencodeResult ───────────────────────────────────
 // 非流式路径的核心：通过 globalEventBus 等待 OpenCode 推理完成，返回完整文本
 // 相比 poll 轮询，事件驱动响应更及时，且不会在 playbook 等长耗时任务上超时
@@ -899,19 +925,60 @@ async function waitForOpencodeResult(opencodeSessionId, prompt, timeoutMs = 3000
     let assistantMessageID = null;
     let promptAccepted = false;
     let silenceTimer = null;
+    let fallbackPollTimer = null;
+    let finalizing = false;
 
     const finish = (text, err) => {
       if (done) return;
       done = true;
       if (silenceTimer) clearTimeout(silenceTimer);
+      if (fallbackPollTimer) clearInterval(fallbackPollTimer);
       if (subId !== null) {
         globalEventBus.unsubscribe(subId);
         subId = null;
       }
       if (err) {
         reject(err);
+        return;
+      }
+      // 冷却后再 resolve，给 OpenCode session 时间完全回到 idle
+      // 这样队列里的下一个请求不会立刻抢到残余的 session.idle 事件
+      if (SESSION_COOLDOWN_MS > 0) {
+        setTimeout(() => resolve(text || ""), SESSION_COOLDOWN_MS);
       } else {
         resolve(text || "");
+      }
+    };
+
+    const finalizeWithFallback = async (reason, statusType = "") => {
+      if (done || finalizing) return;
+      finalizing = true;
+      try {
+        if (fullText) {
+          clearTimeout(overallTimer);
+          finish(fullText, null);
+          return;
+        }
+
+        const polled = await pollAssistantTextFromSession(opencodeSessionId, {
+          attempts: 3,
+          intervalMs: 600,
+        });
+        if (polled) {
+          clearTimeout(overallTimer);
+          finish(polled, null);
+          return;
+        }
+
+        if (statusType === "waiting") {
+          clearTimeout(overallTimer);
+          finish("WAITING_FOR_USER_INPUT", null);
+          return;
+        }
+
+        streamDebug(`finalize fallback empty reason=${reason} status=${statusType} session=${opencodeSessionId}`);
+      } finally {
+        finalizing = false;
       }
     };
 
@@ -997,15 +1064,13 @@ async function waitForOpencodeResult(opencodeSessionId, prompt, timeoutMs = 3000
       const sessionID = pickFirst(props, ["sessionID", "sessionId", "session_id"]);
       const statusType = props.status && props.status.type;
       if (type === "session.status" && sessionID === opencodeSessionId) {
-        if ((statusType === "idle" || statusType === "waiting") && promptAccepted && fullText) {
-          clearTimeout(overallTimer);
-          finish(fullText, null);
+        if ((statusType === "idle" || statusType === "waiting") && promptAccepted) {
+          finalizeWithFallback("session.status", statusType);
         }
         return;
       }
-      if ((type === "session.idle" || type === "session.waiting") && sessionID === opencodeSessionId && promptAccepted && fullText) {
-        clearTimeout(overallTimer);
-        finish(fullText, null);
+      if ((type === "session.idle" || type === "session.waiting") && sessionID === opencodeSessionId && promptAccepted) {
+        finalizeWithFallback(type, type === "session.waiting" ? "waiting" : "idle");
         return;
       }
       if (type === "session.error" && (!sessionID || sessionID === opencodeSessionId)) {
@@ -1015,13 +1080,16 @@ async function waitForOpencodeResult(opencodeSessionId, prompt, timeoutMs = 3000
       }
     };
 
-    subId = globalEventBus.subscribe(opencodeSessionId, processEvent);
-    console.log(`[waitForResult] subscribed  session=${opencodeSessionId}  subId=${subId}`);
-
-    // 等待 SSE 连接就绪，再发消息，彻底消除"消息比连接快"的竞态
+    // 发消息前：先等 SSE 连接就绪，再等 session 空闲
+    // 顺序很重要：waitReady 确保连接在线，waitForSessionIdle 确保 session 不在处理其他消息
     try { await globalEventBus.waitReady(8000); } catch (e) {
       console.warn(`[waitForResult] waitReady timeout: ${e.message}, proceeding anyway`);
     }
+    await waitForSessionIdle(opencodeSessionId);
+
+    // 确认 session 空闲后再订阅事件，避免残余事件干扰
+    subId = globalEventBus.subscribe(opencodeSessionId, processEvent);
+    console.log(`[waitForResult] subscribed  session=${opencodeSessionId}  subId=${subId}`);
 
     // promptAccepted 在发消息前设为 true，避免遗漏早期事件
     promptAccepted = true;
@@ -1031,9 +1099,23 @@ async function waitForOpencodeResult(opencodeSessionId, prompt, timeoutMs = 3000
         method: "POST",
         body: { messageID: userMessageID, parts: [{ type: "text", text: prompt }] },
         rejectOnHTTPError: true,
-        timeoutMs: 30000,  // message POST 本身只是提交，30s 够了
+        timeoutMs: MESSAGE_POST_TIMEOUT_MS,
       });
       console.log(`[waitForResult] message sent  session=${opencodeSessionId}`);
+
+      // 当上游事件偶发缺失时，轮询 messages 兜底，避免 n8n 感知为超时
+      fallbackPollTimer = setInterval(async () => {
+        if (done || finalizing) return;
+        try {
+          const text = await pollAssistantTextFromSession(opencodeSessionId, { attempts: 1, intervalMs: 0 });
+          if (text) {
+            clearTimeout(overallTimer);
+            finish(text, null);
+          }
+        } catch {
+          // ignore fallback polling errors
+        }
+      }, 2000);
     } catch (err) {
       clearTimeout(overallTimer);
       finish(null, err);
@@ -1087,6 +1169,7 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model, syst
   };
 
   const turnStartedAt = recordTurnStart(opencodeSessionId, n8nSessionId);
+  const userMessageID = createMessageID();
   // 每轮请求的唯一 ID，用于日志追踪，排查对话错乱
   const requestId = `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
   console.log(`[request] start  id=${requestId}  session=${opencodeSessionId}  msgId=${userMessageID}`);
@@ -1096,7 +1179,6 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model, syst
   let receivedAnyDelta = false;
   let completed = false;
   let assistantMessageID = null;
-  const userMessageID = createMessageID();
   let promptAccepted = false;
   let messageAccepted = false;
   let turnHasActivity = false;
@@ -1549,295 +1631,6 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model, syst
   }
 }
 
-// ─── 工具：时间格式化 ─────────────────────────────────────────
-
-function formatDuration(ms) {
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ${s % 60}s`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ${m % 60}m`;
-  return `${Math.floor(h / 24)}d ${h % 24}h`;
-}
-
-function formatTokens(n) {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + "M";
-  if (n >= 1_000) return (n / 1_000).toFixed(1) + "K";
-  return String(n);
-}
-
-function timeAgo(ts) {
-  if (!ts) return "-";
-  const s = Math.floor((Date.now() - ts) / 1000);
-  if (s < 5) return "刚刚";
-  if (s < 60) return `${s}秒前`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}分钟前`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}小时前`;
-  return `${Math.floor(h / 24)}天前`;
-}
-
-// ─── Dashboard HTML ───────────────────────────────────────────
-
-function getDashboardHTML() {
-  return `<!DOCTYPE html>
-<html lang="zh">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>OpenCode Bridge Dashboard</title>
-<style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
-  .topbar{background:#1a1d27;border-bottom:1px solid #2d3148;padding:16px 24px;display:flex;align-items:center;gap:16px}
-  .topbar h1{font-size:16px;font-weight:600;color:#fff}
-  .topbar .badge{background:#6366f1;color:#fff;font-size:11px;padding:2px 8px;border-radius:20px}
-  .refresh-btn{margin-left:auto;background:#6366f1;color:#fff;border:none;padding:7px 16px;border-radius:8px;cursor:pointer;font-size:13px;display:flex;align-items:center;gap:6px}
-  .refresh-btn:hover{background:#5558e3}
-  .refresh-btn.loading{opacity:.6;pointer-events:none}
-  .container{padding:24px;max-width:1400px;margin:0 auto}
-  .summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:28px}
-  .card{background:#1a1d27;border:1px solid #2d3148;border-radius:12px;padding:20px}
-  .card-label{font-size:12px;color:#8892b0;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px}
-  .card-value{font-size:28px;font-weight:700;color:#e2e8f0}
-  .card-value.green{color:#34d399}
-  .card-value.blue{color:#60a5fa}
-  .card-value.amber{color:#fbbf24}
-  .card-value.red{color:#f87171}
-  .card-sub{font-size:12px;color:#8892b0;margin-top:4px}
-  .section-title{font-size:14px;font-weight:600;color:#a0aec0;margin-bottom:14px;display:flex;align-items:center;gap:8px}
-  .section-title .dot{width:6px;height:6px;border-radius:50%;background:#6366f1}
-  table{width:100%;border-collapse:collapse;background:#1a1d27;border:1px solid #2d3148;border-radius:12px;overflow:hidden}
-  th{text-align:left;padding:12px 16px;font-size:11px;font-weight:600;color:#8892b0;text-transform:uppercase;letter-spacing:.05em;background:#151721;border-bottom:1px solid #2d3148}
-  td{padding:12px 16px;font-size:13px;border-bottom:1px solid #1e2235;vertical-align:middle}
-  tr:last-child td{border-bottom:none}
-  tr:hover td{background:#1e2235}
-  .session-id{font-family:monospace;font-size:11px;color:#8892b0}
-  .tag{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:500}
-  .tag-active{background:#1a2e1a;color:#34d399;border:1px solid #2d4a2d}
-  .tag-idle{background:#1e2235;color:#8892b0;border:1px solid #2d3148}
-  .tag-error{background:#2e1a1a;color:#f87171;border:1px solid #4a2d2d}
-  .token-bar-wrap{display:flex;align-items:center;gap:8px}
-  .token-bar{height:6px;background:#2d3148;border-radius:3px;flex:1;max-width:100px;overflow:hidden}
-  .token-bar-fill{height:100%;background:#6366f1;border-radius:3px;transition:width .3s}
-  .num{font-variant-numeric:tabular-nums}
-  .empty{text-align:center;padding:48px;color:#4a5568}
-  .last-refresh{font-size:12px;color:#4a5568;margin-top:12px;text-align:right}
-  @keyframes spin{to{transform:rotate(360deg)}}
-  .spin{animation:spin .8s linear infinite;display:inline-block}
-</style>
-</head>
-<body>
-<div class="topbar">
-  <h1>🌉 OpenCode Bridge</h1>
-  <span class="badge" id="status-badge">Loading...</span>
-  <button class="refresh-btn" onclick="loadStats(true)" id="refresh-btn">
-    <span id="refresh-icon">⟳</span> 刷新
-  </button>
-</div>
-<div class="container">
-  <div class="summary-grid" id="summary-grid">
-    <div class="card"><div class="card-label">加载中</div><div class="card-value">...</div></div>
-  </div>
-  <div class="section-title"><span class="dot"></span> Session 列表</div>
-  <div id="sessions-table-wrap">
-    <div class="empty">加载中...</div>
-  </div>
-  <div class="last-refresh" id="last-refresh"></div>
-</div>
-
-<script>
-let maxTotalTokens = 1;
-
-function fmt(n) {
-  if (!n) return "0";
-  if (n >= 1e6) return (n/1e6).toFixed(2)+"M";
-  if (n >= 1e3) return (n/1e3).toFixed(1)+"K";
-  return String(n);
-}
-function fmtMs(ms) {
-  if (!ms) return "-";
-  if (ms < 1000) return ms+"ms";
-  return (ms/1000).toFixed(1)+"s";
-}
-function timeAgo(ts) {
-  if (!ts) return "-";
-  const s = Math.floor((Date.now()-ts)/1000);
-  if (s<5) return "刚刚";
-  if (s<60) return s+"秒前";
-  if (s<3600) return Math.floor(s/60)+"分钟前";
-  if (s<86400) return Math.floor(s/3600)+"小时前";
-  return Math.floor(s/86400)+"天前";
-}
-function fmtDur(ms) {
-  const s=Math.floor(ms/1000);
-  if(s<60) return s+"s";
-  const m=Math.floor(s/60);
-  if(m<60) return m+"m "+s%60+"s";
-  const h=Math.floor(m/60);
-  if(h<24) return h+"h "+m%60+"m";
-  return Math.floor(h/24)+"d "+h%24+"h";
-}
-function statusTag(sess) {
-  if (sess.errors > 0 && sess.turns === 0) return '<span class="tag tag-error">异常</span>';
-  const idle = sess.idleSec;
-  if (idle < 120) return '<span class="tag tag-active">活跃</span>';
-  return '<span class="tag tag-idle">空闲</span>';
-}
-
-async function loadStats(force) {
-  const btn = document.getElementById("refresh-btn");
-  const icon = document.getElementById("refresh-icon");
-  btn.classList.add("loading");
-  icon.classList.add("spin");
-  icon.textContent = "⟳";
-
-  try {
-    if (force) {
-      await fetch("/stats/refresh");
-      await new Promise(r => setTimeout(r, 1500));
-    }
-    const r = await fetch("/stats");
-    const data = await r.json();
-    renderDashboard(data);
-  } catch(e) {
-    document.getElementById("sessions-table-wrap").innerHTML =
-      '<div class="empty">加载失败: ' + e.message + '</div>';
-  } finally {
-    btn.classList.remove("loading");
-    icon.classList.remove("spin");
-    icon.textContent = "⟳";
-    document.getElementById("last-refresh").textContent =
-      "最后刷新：" + new Date().toLocaleTimeString("zh-CN");
-  }
-}
-
-function renderDashboard(data) {
-  const b = data.bridge;
-  const sessions = data.sessions || [];
-
-  // Update badge
-  document.getElementById("status-badge").textContent =
-    b.activeSessionMappings + " active sessions";
-
-  // Summary cards
-  const totalIn = sessions.reduce((a,s)=>a+s.inputTokens,0);
-  const totalOut = sessions.reduce((a,s)=>a+s.outputTokens,0);
-  const totalTokens = totalIn + totalOut;
-  const avgTtft = sessions.length
-    ? Math.round(sessions.filter(s=>s.avgTtftMs).reduce((a,s)=>a+s.avgTtftMs,0)/sessions.filter(s=>s.avgTtftMs).length)
-    : 0;
-
-  document.getElementById("summary-grid").innerHTML = \`
-    <div class="card">
-      <div class="card-label">运行时长</div>
-      <div class="card-value blue">\${fmtDur(b.uptime)}</div>
-      <div class="card-sub">共处理 \${b.requests.totalRequests} 次请求</div>
-    </div>
-    <div class="card">
-      <div class="card-label">成功率</div>
-      <div class="card-value green">\${b.successRate}</div>
-      <div class="card-sub">成功 \${b.requests.successRequests} / 失败 \${b.requests.errorRequests}</div>
-    </div>
-    <div class="card">
-      <div class="card-label">超时次数</div>
-      <div class="card-value \${b.requests.timeoutRequests>0?"amber":"green"}">\${b.requests.timeoutRequests}</div>
-      <div class="card-sub">占总请求 \${b.requests.totalRequests>0?((b.requests.timeoutRequests/b.requests.totalRequests)*100).toFixed(1):0}%</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Session 总数</div>
-      <div class="card-value">\${b.totalTrackedSessions}</div>
-      <div class="card-sub">活跃映射 \${b.activeSessionMappings} 个</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Input Token</div>
-      <div class="card-value blue">\${fmt(totalIn)}</div>
-      <div class="card-sub">Output: \${fmt(totalOut)}</div>
-    </div>
-    <div class="card">
-      <div class="card-label">总 Token 用量</div>
-      <div class="card-value amber">\${fmt(totalTokens)}</div>
-      <div class="card-sub">跨 \${sessions.length} 个 session</div>
-    </div>
-    <div class="card">
-      <div class="card-label">平均首Token延迟</div>
-      <div class="card-value \${avgTtft>5000?"amber":avgTtft>2000?"blue":"green"}">\${fmtMs(avgTtft)}</div>
-      <div class="card-sub">TTFT (Time to First Token)</div>
-    </div>
-  \`;
-
-  // Session table
-  if (sessions.length === 0) {
-    document.getElementById("sessions-table-wrap").innerHTML =
-      '<div class="empty">暂无 Session 数据</div>';
-    return;
-  }
-
-  maxTotalTokens = Math.max(1, ...sessions.map(s=>s.totalTokens));
-
-  const rows = sessions.map(s => {
-    const barWidth = maxTotalTokens > 0 ? Math.round((s.totalTokens/maxTotalTokens)*100) : 0;
-    const sid = s.opencodeSessionId || "-";
-    const shortSid = sid.length > 20 ? sid.slice(0,8)+"…"+sid.slice(-6) : sid;
-    const n8nSid = s.n8nSessionId ? s.n8nSessionId.slice(0,16)+"…" : "-";
-    return \`<tr>
-      <td>
-        <span class="session-id" title="\${sid}">\${shortSid}</span>
-        <div class="session-id" style="margin-top:3px;font-size:10px;color:#4a5568" title="\${s.n8nSessionId||''}">\${n8nSid}</div>
-      </td>
-      <td>\${statusTag(s)}</td>
-      <td class="num">\${timeAgo(s.lastActiveAt)}</td>
-      <td class="num">\${timeAgo(s.createdAt)}</td>
-      <td class="num">\${s.turns}</td>
-      <td class="num" style="color:\${s.errors>0?'#f87171':'#8892b0'}">\${s.errors}\${s.timeouts>0?' (超时'+s.timeouts+')':''}</td>
-      <td>
-        <div class="token-bar-wrap">
-          <span class="num">\${fmt(s.inputTokens)}</span>
-          <div class="token-bar"><div class="token-bar-fill" style="width:\${barWidth}%;background:#60a5fa"></div></div>
-        </div>
-      </td>
-      <td>
-        <div class="token-bar-wrap">
-          <span class="num">\${fmt(s.outputTokens)}</span>
-          <div class="token-bar"><div class="token-bar-fill" style="width:\${barWidth}%"></div></div>
-        </div>
-      </td>
-      <td class="num" style="color:#fbbf24;font-weight:600">\${fmt(s.totalTokens)}</td>
-      <td class="num">\${fmtMs(s.avgTtftMs)}</td>
-      <td class="num">\${fmtMs(s.avgDurationMs)}</td>
-    </tr>\`;
-  }).join("");
-
-  document.getElementById("sessions-table-wrap").innerHTML = \`
-    <table>
-      <thead><tr>
-        <th>Session ID</th>
-        <th>状态</th>
-        <th>最后活跃</th>
-        <th>创建时间</th>
-        <th>对话轮次</th>
-        <th>错误</th>
-        <th>Input Token</th>
-        <th>Output Token</th>
-        <th>总 Token</th>
-        <th>TTFT 均值</th>
-        <th>响应时长均值</th>
-      </tr></thead>
-      <tbody>\${rows}</tbody>
-    </table>
-  \`;
-}
-
-// 加载数据，每 30 秒自动刷新
-loadStats(false);
-setInterval(() => loadStats(false), 30000);
-</script>
-</body>
-</html>`;
-}
-
 // ─── HTTP Server ──────────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
@@ -1916,8 +1709,10 @@ const server = http.createServer(async (req, res) => {
       const responseModel = model || DEFAULT_MODEL;
       const completionId = createCompletionID();
       const created = Math.floor(Date.now() / 1000);
+      const wantsStream = parsed.stream === true;
+      console.log(`[openai] request stream=${wantsStream}  model=${responseModel}`);
 
-      if (parsed.stream === true) {
+      if (wantsStream) {
         await handleStreamRequest(
           req,
           res,
@@ -2211,4 +2006,6 @@ server.listen(BRIDGE_PORT, "0.0.0.0", () => {
   console.log(`   Stream ChunkDelay: ${OPENAI_STREAM_CHUNK_DELAY_MS}ms`);
   console.log(`   Message Timeout:  ${MESSAGE_POST_TIMEOUT_MS}ms`);
   console.log(`   Silence Timeout:  ${SILENCE_TIMEOUT_MS}ms`);
+  console.log(`   Session Cooldown: ${SESSION_COOLDOWN_MS}ms`);
+  console.log(`   Session IdleWait: ${SESSION_IDLE_WAIT_MS}ms`);
 });

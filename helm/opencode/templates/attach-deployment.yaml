@@ -1,0 +1,134 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "opencode.fullname" . }}-attach
+  labels:
+    {{- include "opencode.labels" . | nindent 4 }}
+    {{- with .Values.globalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with .Values.attach.deployment.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with or .Values.globalAnnotations .Values.attach.deployment.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "opencode.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: attach
+  template:
+    metadata:
+      labels:
+        {{- include "opencode.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: attach
+        {{- with .Values.globalLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.attach.pod.labels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- with .Values.globalAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.attach.pod.annotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "opencode.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}-attach
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["opencode"]
+          args:
+            - "attach"
+            - >-
+              {{ .Values.attach.serverUrl | default (printf "http://%s.%s.svc.cluster.local:%d" (include "opencode.fullname" .) .Release.Namespace (int .Values.service.port)) }}
+          {{- if .Values.attach.tty }}
+          tty: true
+          {{- end }}
+          {{- if .Values.attach.stdin }}
+          stdin: true
+          {{- end }}
+          workingDir: /home/opencode/workspace
+          env:
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.attach.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            {{- if .Values.persistence.config.enabled }}
+            - name: config
+              mountPath: /home/opencode/.config/opencode
+            {{- end }}
+            {{- if .Values.persistence.data.enabled }}
+            - name: data
+              mountPath: /home/opencode/.local/share/opencode
+            {{- end }}
+            {{- if .Values.persistence.workspace.enabled }}
+            - name: workspace
+              mountPath: /home/opencode/workspace
+            {{- end }}
+            {{- if .Values.persistence.playbook.enabled }}
+            - name: playbook
+              mountPath: {{ .Values.persistence.playbook.mountPath | default "/home/opencode/workspace/playbook" }}
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.attach.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.attach.resources | nindent 12 }}
+      volumes:
+        {{- if .Values.persistence.config.enabled }}
+        - name: config
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.config.existingClaim | default (print (include "opencode.fullname" .) "-config") }}
+        {{- end }}
+        {{- if .Values.persistence.data.enabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.data.existingClaim | default (print (include "opencode.fullname" .) "-data") }}
+        {{- end }}
+        {{- if .Values.persistence.workspace.enabled }}
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.workspace.existingClaim | default (print (include "opencode.fullname" .) "-workspace") }}
+        {{- end }}
+        {{- if .Values.persistence.playbook.enabled }}
+        - name: playbook
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.playbook.existingClaim | default (print (include "opencode.fullname" .) "-playbook") }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.attach.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.attach.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.attach.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

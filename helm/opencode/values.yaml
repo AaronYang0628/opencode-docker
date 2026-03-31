@@ -7,6 +7,7 @@ image:
 
 # Container command and args
 # Default: run opencode in serve mode (REST API)
+# To use web mode (Web UI + REST API), set: ["opencode", "web", "--port", "4000", "--hostname", "0.0.0.0"]
 # To use TUI mode instead, set command: ["opencode"] and args: []
 command: ["opencode"]
 args: ["serve", "--port", "4000", "--hostname", "0.0.0.0"]
@@ -342,6 +343,133 @@ probes:
     timeoutSeconds: 3
     successThreshold: 1
     failureThreshold: 30
+
+# Web deployment configuration (Web UI)
+web:
+  enabled: false
+
+  # Port and hostname for web server
+  port: 4000
+  hostname: "0.0.0.0"
+
+  # Extra args to pass to opencode web
+  extraArgs: []
+
+  # Deployment labels and annotations
+  deployment:
+    labels: {}
+    annotations: {}
+
+  # Pod labels and annotations
+  pod:
+    labels: {}
+    annotations: {}
+
+  # Environment variables
+  extraEnv: []
+
+  # Extra volume mounts
+  extraVolumeMounts: []
+
+  service:
+    type: ClusterIP
+    port: 4000
+    labels: {}
+    annotations: {}
+
+  resources:
+    limits:
+      cpu: "2"
+      memory: 2Gi
+    requests:
+      cpu: 500m
+      memory: 512Mi
+
+  probes:
+    liveness:
+      enabled: true
+      tcpSocket:
+        port: 4000
+      initialDelaySeconds: 30
+      periodSeconds: 10
+      timeoutSeconds: 5
+      successThreshold: 1
+      failureThreshold: 3
+
+    readiness:
+      enabled: true
+      tcpSocket:
+        port: 4000
+      initialDelaySeconds: 10
+      periodSeconds: 5
+      timeoutSeconds: 3
+      successThreshold: 1
+      failureThreshold: 3
+
+    startup:
+      enabled: true
+      tcpSocket:
+        port: 4000
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      timeoutSeconds: 3
+      successThreshold: 1
+      failureThreshold: 30
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+  ingress:
+    enabled: false
+    className: ""
+    labels: {}
+    annotations: {}
+    hosts:
+      - host: opencode-web.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+
+# Attach deployment configuration (for terminal access)
+attach:
+  enabled: false
+
+  # Server URL to connect to (defaults to the main opencode service)
+  serverUrl: ""
+
+  # Deployment labels and annotations
+  deployment:
+    labels: {}
+    annotations: {}
+
+  # Pod labels and annotations
+  pod:
+    labels: {}
+    annotations: {}
+
+  # Enable TTY and stdin for interactive terminal
+  tty: true
+  stdin: true
+
+  # Environment variables
+  extraEnv: []
+
+  # Extra volume mounts
+  extraVolumeMounts: []
+
+  resources:
+    limits:
+      cpu: "1"
+      memory: 1Gi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 # Bridge configuration
 bridge:

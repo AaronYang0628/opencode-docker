@@ -1,0 +1,47 @@
+{{- if and .Values.web.enabled .Values.web.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "opencode.fullname" . }}-web
+  labels:
+    {{- include "opencode.labels" . | nindent 4 }}
+    {{- with .Values.globalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with .Values.web.ingress.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.web.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.web.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if .Values.web.ingress.tls }}
+  tls:
+    {{- range .Values.web.ingress.tls }}
+    - hosts:
+        {{- range .hosts }}
+        - {{ . | quote }}
+        {{- end }}
+      secretName: {{ .secretName }}
+    {{- end }}
+  {{- end }}
+  rules:
+    {{- range .Values.web.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ $.Values.web.service.name | default (printf "%s-web" (include "opencode.fullname" $)) }}
+                port:
+                  number: {{ $.Values.web.service.port }}
+          {{- end }}
+    {{- end }}
+{{- end }}

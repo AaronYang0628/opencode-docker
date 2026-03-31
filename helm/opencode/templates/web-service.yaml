@@ -1,0 +1,28 @@
+{{- if .Values.web.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "opencode.fullname" . }}-web
+  labels:
+    {{- include "opencode.labels" . | nindent 4 }}
+    {{- with .Values.globalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with .Values.web.service.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with or .Values.globalAnnotations .Values.web.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.web.service.type }}
+  ports:
+    - port: {{ .Values.web.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "opencode.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+{{- end }}
