@@ -31,6 +31,25 @@ const SILENCE_TIMEOUT_MS = Math.max(0, parseInt(process.env.BRIDGE_SILENCE_TIMEO
 // N8N sessionId → OpenCode sessionId 映射（多轮对话）
 const sessionMap = new Map();
 
+// 每个 OpenCode session 的请求队列：同一 session 同时只允许一个请求在 waitForOpencodeResult 中运行
+// 防止 n8n AI Agent 并发调用 LLM 时多个订阅者争抢同一个 session.idle 事件
+const sessionQueue = new Map(); // opencodeSessionId -> Promise (tail of queue)
+
+function enqueueSessionRequest(queueKey, fn) {
+  const prev = sessionQueue.get(queueKey) || Promise.resolve();
+  const isQueued = sessionQueue.has(queueKey);
+  if (isQueued) {
+    console.log(`[queue] waiting  key=${String(queueKey).slice(0, 24)}`);
+  }
+  const next = prev.then(() => {
+    console.log(`[queue] running  key=${String(queueKey).slice(0, 24)}`);
+    return fn();
+  }).catch((err) => { throw err; });
+  // Store a "silent" version that never rejects (so the queue keeps moving)
+  sessionQueue.set(queueKey, next.catch(() => {}));
+  return next;
+}
+
 // ─── 统计数据 ────────────────────────────────────────────────
 // Bridge 启动时间
 const BRIDGE_START_TIME = Date.now();
@@ -42,13 +61,37 @@ const BRIDGE_START_TIME = Date.now();
 //   2. OpenCode 并发 SSE 连接限制
 //   3. 多请求互相干扰（错乱根本原因）
 const globalEventBus = {
-  // 当前 SSE 连接
   req: null,
   connected: false,
   reconnectTimer: null,
-  // 订阅者 Map: subscriptionId -> { sessionId, callback }
   subscribers: new Map(),
   _subIdCounter: 0,
+
+  // connectedPromise: resolves when the SSE connection is confirmed ready.
+  // All senders must await this before posting messages, so no events are
+  // missed between "message sent" and "connection established".
+  _connectedResolve: null,
+  connectedPromise: null,
+
+  _initPromise() {
+    if (this.connectedPromise) return;
+    this.connectedPromise = new Promise((resolve) => {
+      this._connectedResolve = resolve;
+    });
+  },
+
+  // waitReady: await this before sending any message to OpenCode.
+  // Resolves immediately if already connected, otherwise waits up to timeoutMs.
+  async waitReady(timeoutMs = 10000) {
+    if (this.connected) return;
+    this._initPromise();
+    return Promise.race([
+      this.connectedPromise,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("event-bus connect timeout")), timeoutMs)
+      ),
+    ]);
+  },
 
   subscribe(opencodeSessionId, callback) {
     const id = ++this._subIdCounter;
@@ -62,8 +105,6 @@ const globalEventBus = {
   },
 
   _dispatch(event) {
-    // Pre-filter by sessionId before dispatching to each subscriber.
-    // This is the primary guard against cross-session event contamination.
     const data = event && event.data;
     const props = (data && data.properties) || {};
     let eventSessionId = null;
@@ -84,6 +125,7 @@ const globalEventBus = {
 
   _connect() {
     if (this.req) return;
+    this._initPromise();
     const u = new URL(`${OPENCODE_BASE}/event`);
     const opts = {
       hostname: u.hostname,
@@ -102,6 +144,12 @@ const globalEventBus = {
       this.connected = true;
       this.req = req;
       console.log("[event-bus] connected to OpenCode /event");
+      // Resolve the connectedPromise so any waiting senders can proceed
+      if (this._connectedResolve) {
+        this._connectedResolve();
+        this._connectedResolve = null;
+        this.connectedPromise = null; // reset for next reconnect cycle
+      }
 
       const parse = createSSEParser((ev) => this._dispatch(ev));
       res.on("data", parse);
@@ -118,7 +166,7 @@ const globalEventBus = {
       this.req = null;
       this._scheduleReconnect();
     });
-    req.setTimeout(0); // no timeout on the shared stream
+    req.setTimeout(0);
     req.end();
     this.req = req;
   },
@@ -128,10 +176,15 @@ const globalEventBus = {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.req = null;
-      if (this.subscribers.size > 0) this._connect();
+      this._connect(); // always reconnect, not just when subscribers exist
     }, 2000);
   },
 };
+
+// Connect to OpenCode /event immediately on bridge startup.
+// This eliminates the race where LLM responds before the SSE connection
+// is established, causing events to be missed entirely.
+globalEventBus._connect();
 
 // 请求计数器
 const stats = {
@@ -818,21 +871,174 @@ async function resolveOpencodeSession(n8nSessionId, model, rejectOnHTTPError = f
       getOrCreateMetrics(opencodeSessionId, null);
     }
 
-    // 新建 session 时，若有 system prompt，作为第一条消息注入（只注入一次，后续轮次不重复）
+    // system prompt 不再通过消息注入：
+    // 发消息会触发 OpenCode 进行一次 LLM 推理，产生 session.idle 事件，
+    // 被后续的 waitForResult 订阅者误消费，导致真正的用户消息丢失。
+    // n8n 注入的 system prompt 内容只是 sessionId，对 OpenCode 无意义，直接忽略。
     if (systemPrompt && systemPrompt.trim()) {
-      console.log(`[phase] inject-system-prompt  len=${systemPrompt.length}  session=${opencodeSessionId}`);
-      await fetchJSON(`${OPENCODE_BASE}/session/${opencodeSessionId}/message`, {
-        method: "POST",
-        body: { parts: [{ type: "text", text: `[SYSTEM]
-${systemPrompt.trim()}` }] },
-        rejectOnHTTPError: false,
-        timeoutMs: 30000,
-      });
+      console.log(`[phase] skip-system-prompt  len=${systemPrompt.length}  session=${opencodeSessionId}  reason=avoids-spurious-idle-event`);
     }
   } else {
     console.log(`[phase] reuse-session  n8n:${validId ? validId.slice(0,20) : "none"} -> opencode:${opencodeSessionId}`);
   }
   return opencodeSessionId;
+}
+
+// ─── waitForOpencodeResult ───────────────────────────────────
+// 非流式路径的核心：通过 globalEventBus 等待 OpenCode 推理完成，返回完整文本
+// 相比 poll 轮询，事件驱动响应更及时，且不会在 playbook 等长耗时任务上超时
+
+async function waitForOpencodeResult(opencodeSessionId, prompt, timeoutMs = 300000) {
+  const userMessageID = createMessageID();
+  const startedAt = Date.now();
+
+  return new Promise(async (resolve, reject) => {
+    let subId = null;
+    let done = false;
+    let fullText = "";
+    let assistantMessageID = null;
+    let promptAccepted = false;
+    let silenceTimer = null;
+
+    const finish = (text, err) => {
+      if (done) return;
+      done = true;
+      if (silenceTimer) clearTimeout(silenceTimer);
+      if (subId !== null) {
+        globalEventBus.unsubscribe(subId);
+        subId = null;
+      }
+      if (err) {
+        reject(err);
+      } else {
+        resolve(text || "");
+      }
+    };
+
+    // 重置静默计时器：收到 delta 后，若 SILENCE_TIMEOUT_MS 内无新 delta 则视为完成
+    const resetSilence = () => {
+      if (SILENCE_TIMEOUT_MS <= 0) return;
+      if (silenceTimer) clearTimeout(silenceTimer);
+      silenceTimer = setTimeout(() => {
+        console.log(`[waitForResult] silence-timeout  elapsed=${Date.now()-startedAt}ms  session=${opencodeSessionId}`);
+        finish(fullText, null);
+      }, SILENCE_TIMEOUT_MS);
+    };
+
+    // 整体超时：evict session mapping，确保下次请求使用新的 OpenCode session
+    // 避免 playbook 等长耗时任务卡住后，后续消息也卡在同一个 stuck session
+    const overallTimer = setTimeout(() => {
+      console.error(`[waitForResult] overall-timeout  elapsed=${Date.now()-startedAt}ms  session=${opencodeSessionId}`);
+      // 清除 sessionMap 里的映射，下次请求会创建新的干净 session
+      for (const [k, v] of sessionMap) {
+        if (v === opencodeSessionId) {
+          sessionMap.delete(k);
+          console.warn(`[waitForResult] evicted stuck session  n8n:${k.slice(0,20)} -> opencode:${opencodeSessionId}`);
+        }
+      }
+      finish(fullText || null, fullText ? null : new Error("waitForOpencodeResult timeout"));
+    }, timeoutMs);
+
+    const processEvent = ({ data }) => {
+      if (done || !data || typeof data !== "object") return;
+      const type = data.type;
+      const props = data.properties || {};
+
+      if (type === "message.updated") {
+        const info = props.info || {};
+        const infoSessionID = pickFirst(info, ["sessionID", "sessionId", "session_id"]);
+        if (infoSessionID !== opencodeSessionId) return;
+        const infoID = pickFirst(info, ["id", "messageID", "messageId", "message_id"]);
+        const parentID = pickFirst(info, ["parentID", "parentId", "parent_id"]);
+
+        if (info.role === "user" && infoID === userMessageID) {
+          promptAccepted = true;
+          return;
+        }
+        if (info.role === "assistant" && parentID === userMessageID) {
+          assistantMessageID = infoID;
+          if (info.time && info.time.completed) {
+            clearTimeout(overallTimer);
+            finish(fullText, null);
+          }
+          return;
+        }
+        if (assistantMessageID && infoID === assistantMessageID && info.time && info.time.completed) {
+          clearTimeout(overallTimer);
+          finish(fullText, null);
+        }
+        return;
+      }
+
+      if (type === "message.part.updated") {
+        const part = props.part || {};
+        const partSessionID = pickFirst(part, ["sessionID", "sessionId", "session_id"]);
+        const partMessageID = pickFirst(part, ["messageID", "messageId", "message_id"]);
+        if (partSessionID !== opencodeSessionId || part.type !== "text") return;
+        if (partMessageID === userMessageID) return;
+        if (!assistantMessageID && partMessageID) assistantMessageID = partMessageID;
+        if (partMessageID !== assistantMessageID) return;
+
+        let delta = typeof props.delta === "string" ? props.delta : "";
+        if (!delta && typeof part.text === "string" && part.text.length > fullText.length) {
+          delta = part.text.startsWith(fullText) ? part.text.slice(fullText.length) : part.text;
+        }
+        if (delta) {
+          fullText += delta;
+          resetSilence();
+          if (delta.includes("WAITING_FOR_USER_INPUT") || fullText.includes("WAITING_FOR_USER_INPUT")) {
+            clearTimeout(overallTimer);
+            finish(fullText, null);
+          }
+        }
+        return;
+      }
+
+      const sessionID = pickFirst(props, ["sessionID", "sessionId", "session_id"]);
+      const statusType = props.status && props.status.type;
+      if (type === "session.status" && sessionID === opencodeSessionId) {
+        if ((statusType === "idle" || statusType === "waiting") && promptAccepted && fullText) {
+          clearTimeout(overallTimer);
+          finish(fullText, null);
+        }
+        return;
+      }
+      if ((type === "session.idle" || type === "session.waiting") && sessionID === opencodeSessionId && promptAccepted && fullText) {
+        clearTimeout(overallTimer);
+        finish(fullText, null);
+        return;
+      }
+      if (type === "session.error" && (!sessionID || sessionID === opencodeSessionId)) {
+        const err = props.error;
+        clearTimeout(overallTimer);
+        finish(null, new Error((err && (err.data && err.data.message || err.name)) || "session error"));
+      }
+    };
+
+    subId = globalEventBus.subscribe(opencodeSessionId, processEvent);
+    console.log(`[waitForResult] subscribed  session=${opencodeSessionId}  subId=${subId}`);
+
+    // 等待 SSE 连接就绪，再发消息，彻底消除"消息比连接快"的竞态
+    try { await globalEventBus.waitReady(8000); } catch (e) {
+      console.warn(`[waitForResult] waitReady timeout: ${e.message}, proceeding anyway`);
+    }
+
+    // promptAccepted 在发消息前设为 true，避免遗漏早期事件
+    promptAccepted = true;
+
+    try {
+      await fetchJSON(`${OPENCODE_BASE}/session/${opencodeSessionId}/message`, {
+        method: "POST",
+        body: { messageID: userMessageID, parts: [{ type: "text", text: prompt }] },
+        rejectOnHTTPError: true,
+        timeoutMs: 30000,  // message POST 本身只是提交，30s 够了
+      });
+      console.log(`[waitForResult] message sent  session=${opencodeSessionId}`);
+    } catch (err) {
+      clearTimeout(overallTimer);
+      finish(null, err);
+    }
+  });
 }
 
 async function handleStreamRequest(req, res, { prompt, n8nSessionId, model, systemPrompt = "" }, options = {}) {
@@ -1242,6 +1448,11 @@ async function handleStreamRequest(req, res, { prompt, n8nSessionId, model, syst
     // 订阅全局事件总线，只接收本 session 的事件
     subId = globalEventBus.subscribe(opencodeSessionId, processEvent);
     console.log(`[phase] subscribed  id=${requestId}  session=${opencodeSessionId}  subId=${subId}  totalSubs=${globalEventBus.subscribers.size}`);
+
+    // 等待 SSE 连接就绪，再发消息，彻底消除"消息比连接快"的竞态
+    try { await globalEventBus.waitReady(8000); } catch (e) {
+      console.warn(`[phase] waitReady timeout: ${e.message}, proceeding anyway  session=${opencodeSessionId}`);
+    }
 
     // promptAccepted = true 必须在发送消息之前设置
     // 事件流在消息发出后立刻开始推送，晚于消息发出设置会导致早期 delta 被丢弃
@@ -1721,29 +1932,20 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      // 非流式请求：bridge 内部用 globalEventBus 等待 OpenCode 推理完成，再返回完整 JSON
+      // 队列 key 用 n8nSessionId（在 resolveOpencodeSession 之前就已知），
+      // 确保同一 n8n session 的并发请求完全串行，不会出现两个 waitForResult 同时订阅同一个 OpenCode session
+      const queueKey = n8nSessionId || ("anon_" + responseModel);
       try {
-        const opencodeSessionId = await resolveOpencodeSession(n8nSessionId, responseModel, true, systemPrompt);
-        console.log(`[OpenAI兼容消息] ${prompt.slice(0, 80)}`);
-
-        const msgResponse = await fetchJSON(`${OPENCODE_BASE}/session/${opencodeSessionId}/message`, {
-          method: "POST",
-          body: { parts: [{ type: "text", text: prompt }] },
-          rejectOnHTTPError: true,
+        const result = await enqueueSessionRequest(queueKey, async () => {
+          const opencodeSessionId = await resolveOpencodeSession(n8nSessionId, responseModel, true, systemPrompt);
+          console.log(`[OpenAI兼容消息] ${prompt.slice(0, 80)}  session=${opencodeSessionId}`);
+          return waitForOpencodeResult(opencodeSessionId, prompt, MESSAGE_POST_TIMEOUT_MS);
         });
-
-        const result = extractText(msgResponse);
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify(
-            buildOpenAIChatCompletion({
-              completionId,
-              created,
-              model: responseModel,
-              content: result,
-            })
-          )
-        );
+        res.end(JSON.stringify(buildOpenAIChatCompletion({ completionId, created, model: responseModel, content: result })));
       } catch (err) {
+        console.error(`[OpenAI兼容消息] error: ${err.message}  queueKey=${queueKey}`);
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: { message: err.message, type: "server_error" } }));
       }
@@ -1926,6 +2128,66 @@ const server = http.createServer(async (req, res) => {
     refreshAllTokenStats().catch(() => {});
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, message: "Token refresh triggered" }));
+    return;
+  }
+
+  // ── GET /session/:id — proxy to OpenCode session detail ───────
+  if (req.method === "GET" && /^\/session\/[^/]+$/.test(normalizedPath)) {
+    const sessionId = normalizedPath.slice("/session/".length);
+    try {
+      const [sessionInfo, messages] = await Promise.all([
+        fetchJSON(`${OPENCODE_BASE}/session/${sessionId}`, { timeoutMs: 5000 }).catch(() => null),
+        fetchJSON(`${OPENCODE_BASE}/session/${sessionId}/messages`, { timeoutMs: 5000 }).catch(() => []),
+      ]);
+      const metrics = sessionMetrics.get(sessionId) || null;
+      const queuePending = sessionQueue.has(sessionId);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        sessionId,
+        opencode: sessionInfo,
+        messageCount: Array.isArray(messages) ? messages.length : 0,
+        messages: Array.isArray(messages) ? messages.map(m => ({
+          id: m.id,
+          role: m.role,
+          time: m.time,
+          tokens: m.tokens || m.usage || null,
+          parts: Array.isArray(m.parts) ? m.parts.map(p => ({
+            type: p.type,
+            textPreview: typeof p.text === "string" ? p.text.slice(0, 200) : null,
+          })) : [],
+        })) : [],
+        bridgeMetrics: metrics,
+        queuePending,
+      }, null, 2));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // ── GET /sessions — list all OpenCode sessions ────────────────
+  if (req.method === "GET" && normalizedPath === "/sessions") {
+    try {
+      const allSessions = await fetchJSON(`${OPENCODE_BASE}/session`, { timeoutMs: 5000 }).catch(() => []);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        total: Array.isArray(allSessions) ? allSessions.length : 0,
+        bridgeTracked: sessionMetrics.size,
+        activeMappings: sessionMap.size,
+        sessions: Array.isArray(allSessions) ? allSessions.map(s => ({
+          id: s.id,
+          title: s.title,
+          time: s.time,
+          bridgeMetrics: sessionMetrics.get(s.id) || null,
+          inBridgeMap: [...sessionMap.values()].includes(s.id),
+          queuePending: sessionQueue.has(s.id),
+        })) : [],
+      }, null, 2));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
     return;
   }
 

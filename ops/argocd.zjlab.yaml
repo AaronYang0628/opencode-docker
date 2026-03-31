@@ -1,0 +1,155 @@
+kubectl -n argocd apply -f - <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: opencode
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: oci://ghcr.io/aaronyang0628/opencode
+    targetRevision: 0.22.0
+    chart: opencode
+    helm:
+      values: |
+        image:
+          repository: ghcr.io/nimbleflux/opencode-docker
+          tag: 1.2.26
+          pullPolicy: Always
+        replicaCount: 1
+        command:
+          - opencode
+        args:
+          - serve
+          - --port
+          - "4000"
+          - --hostname
+          - "0.0.0.0"
+        service:
+          type: ClusterIP
+          port: 4000
+        env:
+          OPENCODE_PORT: "4000"
+        extraVolumes:
+          - name: opencode-config
+            configMap:
+              name: opencode-config
+        extraVolumeMounts:
+          - name: opencode-config
+            mountPath: /home/opencode/.config/opencode/opencode.json
+            subPath: opencode.json
+            readOnly: true
+        persistence:
+          enabled: true
+          storageClass: local-path
+          config:
+            enabled: false 
+          data:
+            enabled: true
+            size: 1Gi
+          workspace:
+            enabled: true
+            size: 5Gi
+          playbook:
+            enabled: true
+            mountPath: /home/opencode/workspace/playbook
+            example:
+              enabled: true
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2
+            memory: 4Gi
+        probes:
+          liveness:
+            tcpSocket:
+              port: 4000
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readiness:
+            tcpSocket:
+              port: 4000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          startup:
+            tcpSocket:
+              port: 4000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 30
+        ingress:
+          enabled: true
+          className: nginx
+          annotations:
+            kubernetes.io/ingress.class: nginx
+            cert-manager.io/cluster-issuer: self-signed-ca-issuer
+            nginx.ingress.kubernetes.io/proxy-connect-timeout: "600"
+            nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+            nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+            nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+            nginx.ingress.kubernetes.io/upstream-keepalive-connections: "50"
+            nginx.ingress.kubernetes.io/upstream-keepalive-timeout: "60"
+          hosts:
+            - host: opencode.ay.dev
+              paths:
+                - path: /
+                  pathType: Prefix
+          tls:
+          - hosts:
+            - opencode.ay.dev
+            secretName: opencode.ay.dev-tls
+        globalLabels:
+          app.kubernetes.io/part-of: opencode
+          environment: production
+        bridge:
+          enabled: true
+          image:
+            repository: crpi-wixjy6gci86ms14e.cn-hongkong.personal.cr.aliyuncs.com/ay-dev/opencode-bridge
+            tag: "v20260331r2"
+          env:
+            defaultModel: "MiniMaxAI/MiniMax-M2.5"
+            openaiStreamChunkSize: "4"
+            openaiStreamChunkDelayMs: "10"
+            enableLeadingEchoFilter: "false"
+            bridgeMessageTimeoutMs: "550000"
+            bridgeSilenceTimeoutMs: "20000"
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          ingress:
+            enabled: true
+            annotations:
+              kubernetes.io/ingress.class: nginx
+              cert-manager.io/cluster-issuer: self-signed-ca-issuer
+              nginx.ingress.kubernetes.io/proxy-buffering: "off"
+              nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+              nginx.ingress.kubernetes.io/proxy-connect-timeout: "300"
+              nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+              nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+              nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+              nginx.ingress.kubernetes.io/upstream-keepalive-connections: "50"
+              nginx.ingress.kubernetes.io/upstream-keepalive-timeout: "60"
+            hosts:
+              - host: opencode-bridge.ay.dev
+                paths:
+                  - path: /
+                    pathType: Prefix
+            tls:
+              - secretName: opencode-bridge-tls
+                hosts:
+                  - opencode-bridge.ay.dev        
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: opencode
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+EOF
